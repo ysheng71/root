@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sec-edgar"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1",
+    "requests>=2.31",
+    "tenacity>=8.2",
+    "openpyxl>=3.1",
+]
+
+[project.scripts]
+sec-edgar = "sec_edgar.cli:cli"
+
+[project.optional-dependencies]
+dev = ["pytest", "responses"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sec_edgar"]

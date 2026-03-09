@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# Database files (can be large; regenerated via `sec-edgar fetch`)
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Claude Code internal
+.claude/
