@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -275,6 +276,7 @@ def build_reports(
     period: str,
     num_periods: int,
     scale: int = 1_000_000,
+    price: Optional[float] = None,
 ) -> List[Report]:
     company = _get_company(conn, ticker)
     if not company:
@@ -282,16 +284,28 @@ def build_reports(
 
     reports = []
     for stmt in statements:
-        r = build_report(
-            conn=conn,
-            cik=company["cik"],
-            ticker=company["ticker"],
-            company_name=company["name"],
-            statement=stmt,
-            period=period,
-            num_periods=num_periods,
-            scale=scale,
-        )
+        if stmt == "ratios":
+            r = build_ratio_report(
+                conn=conn,
+                cik=company["cik"],
+                ticker=company["ticker"],
+                company_name=company["name"],
+                period=period,
+                num_periods=num_periods,
+                scale=scale,
+                price=price,
+            )
+        else:
+            r = build_report(
+                conn=conn,
+                cik=company["cik"],
+                ticker=company["ticker"],
+                company_name=company["name"],
+                statement=stmt,
+                period=period,
+                num_periods=num_periods,
+                scale=scale,
+            )
         reports.append(r)
     return reports
 
@@ -531,5 +545,462 @@ def write_excel(reports: List[Report], output_path: str) -> None:
         for col_offset in range(len(report.periods)):
             col_letter = get_column_letter(4 + col_offset)
             ws.column_dimensions[col_letter].width = 14
+
+    wb.save(output_path)
+
+
+# ---------------------------------------------------------------------------
+# Ratio report — data layer
+# ---------------------------------------------------------------------------
+
+def _pool_from_flat(
+    flat: Dict[Tuple[str, str], Optional[float]],
+    periods: List[str],
+) -> Dict[str, Dict[str, Optional[float]]]:
+    """Reshape flat {(name, period): value} → {name: {period: value}}."""
+    pool: Dict[str, Dict[str, Optional[float]]] = {}
+    for (name, p), v in flat.items():
+        if name not in pool:
+            pool[name] = {pp: None for pp in periods}
+        pool[name][p] = v
+    # Fill missing periods with None
+    for name in pool:
+        for p in periods:
+            pool[name].setdefault(p, None)
+    return pool
+
+
+def fetch_all_metrics(
+    conn: sqlite3.Connection,
+    cik: str,
+    period: str,
+    num_periods: int,
+) -> Tuple[Dict[str, Dict[str, Optional[float]]], List[str]]:
+    """
+    Fetch base metrics from all three statements and compute derived metrics.
+    Returns (data_pool, sorted_periods).
+    data_pool: {metric_name: {period_label: value}}
+    """
+    # Collect flat facts across all statements
+    all_flat: Dict[Tuple[str, str], Optional[float]] = {}
+    for stmt in ("income_statement", "balance_sheet", "cash_flow"):
+        flat = _fetch_facts(conn, cik, stmt, period, num_periods)
+        all_flat.update(flat)
+
+    # Determine the unified period list
+    all_periods = _ordered_periods(all_flat, period, num_periods)
+
+    pool = _pool_from_flat(all_flat, all_periods)
+
+    # Compute derived metrics from metrics.py (ebitda, free_cash_flow, etc.)
+    # _compute_derived expects {(name, period): value}; adapt from pool
+    for m in ALL_METRICS:
+        if m.is_derived and m.derived_expr:
+            result: Dict[str, Optional[float]] = {}
+            for p in all_periods:
+                try:
+                    ns = {
+                        metric.name: (
+                            pool.get(metric.name, {}).get(p)
+                            if pool.get(metric.name, {}).get(p) is not None
+                            else float("nan")
+                        )
+                        for metric in ALL_METRICS
+                    }
+                    val = eval(m.derived_expr, {"__builtins__": {}}, ns)  # noqa: S307
+                    result[p] = None if (math.isnan(val) or math.isinf(val)) else val
+                except Exception:
+                    result[p] = None
+            pool[m.name] = result
+
+    return pool, all_periods
+
+
+# ---------------------------------------------------------------------------
+# Ratio report — model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RatioRow:
+    metric_name: str
+    display: str
+    fmt: str           # "percent" | "times" | "multiple" | "days" | "currency" | "currency_per_share" | "raw"
+    indent: int
+    values: Dict[str, Optional[float]]
+    is_section_header: bool = False
+    section_label: str = ""
+
+
+@dataclass
+class RatioReport:
+    company_name: str
+    ticker: str
+    statement: str = "ratios"
+    statement_title: str = "Ratios & Valuation"
+    period: str = "annual"
+    periods: List[str] = None
+    rows: List[RatioRow] = None
+    scale: int = 1_000_000
+    price: Optional[float] = None
+
+
+def build_ratio_report(
+    conn: sqlite3.Connection,
+    cik: str,
+    ticker: str,
+    company_name: str,
+    period: str,
+    num_periods: int,
+    scale: int = 1_000_000,
+    price: Optional[float] = None,
+) -> RatioReport:
+    from .computed import RatioEngine
+    from .ratio_defs import ALL_COMPUTED, VISIBLE_COMPUTED, SECTION_TITLES, SECTION_ORDER
+
+    # Build base data pool
+    pool, periods = fetch_all_metrics(conn, cik, period, num_periods)
+
+    # Run the ratio engine (evaluates ALL_COMPUTED in order, growing the pool)
+    engine = RatioEngine()
+    pool = engine.compute_all(ALL_COMPUTED, pool, periods, price=price)
+
+    # Build rows grouped by section
+    rows: List[RatioRow] = []
+    prev_section = None
+
+    for m in VISIBLE_COMPUTED:
+        # Section header
+        if m.section != prev_section:
+            title = SECTION_TITLES.get(m.section, m.section.replace("_", " ").title())
+            # Skip market section header if no price (all dashes anyway — still show it)
+            rows.append(RatioRow(
+                metric_name="",
+                display="",
+                fmt="",
+                indent=0,
+                values={},
+                is_section_header=True,
+                section_label=title,
+            ))
+            prev_section = m.section
+
+        vals = {p: pool.get(m.name, {}).get(p) for p in periods}
+        rows.append(RatioRow(
+            metric_name=m.name,
+            display=m.display,
+            fmt=m.fmt,
+            indent=m.indent,
+            values=vals,
+        ))
+
+    return RatioReport(
+        company_name=company_name,
+        ticker=ticker,
+        periods=periods,
+        rows=rows,
+        scale=scale,
+        price=price,
+        period=period,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ratio value formatter
+# ---------------------------------------------------------------------------
+
+def _fmt_ratio_value(value: Optional[float], fmt: str, scale: int) -> str:
+    if value is None:
+        return "—"
+    if fmt == "percent":
+        # Values are in percentage points (e.g. 23.4 means 23.4%)
+        if abs(value) < 1000:
+            return f"{value:.1f}%"
+        return f"{value:.0f}%"
+    if fmt in ("times", "multiple"):
+        return f"{value:.1f}x"
+    if fmt == "days":
+        return f"{value:.0f}"
+    if fmt == "currency":
+        scaled = value / scale
+        if abs(scaled) >= 1000:
+            return f"{scaled:,.0f}"
+        return f"{scaled:,.1f}"
+    if fmt == "currency_per_share":
+        return f"${value:.2f}"
+    return f"{value:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Ratio text formatter
+# ---------------------------------------------------------------------------
+
+def format_ratio_text(report: RatioReport) -> str:
+    LABEL_WIDTH = 42
+    COL_WIDTH = 12
+    total_width = LABEL_WIDTH + COL_WIDTH * len(report.periods) + 2
+
+    lines: List[str] = []
+    sep = "─" * total_width
+    thick = "═" * total_width
+
+    lines.append(thick)
+    price_str = f"  |  Price ${report.price:,.2f}" if report.price else ""
+    lines.append(f"  {report.company_name} ({report.ticker})  —  {report.statement_title}")
+    granularity = "Annual" if report.period == "annual" else "Quarterly"
+    lines.append(f"  {granularity}  |  {_scale_label(report.scale)}{price_str}")
+    lines.append(thick)
+
+    header = " " * LABEL_WIDTH
+    for p in report.periods:
+        header += p.rjust(COL_WIDTH)
+    lines.append(header)
+    lines.append(sep)
+
+    for row in report.rows:
+        if row.is_section_header:
+            lines.append("")
+            lines.append(f"  {row.section_label.upper()}")
+            lines.append(sep)
+            continue
+
+        prefix = "  " + ("  " if row.indent else "")
+        label = (prefix + row.display)[:LABEL_WIDTH].ljust(LABEL_WIDTH)
+
+        vals = ""
+        for p in report.periods:
+            vals += _fmt_ratio_value(row.values.get(p), row.fmt, report.scale).rjust(COL_WIDTH)
+
+        lines.append(label + vals)
+        if row.indent == 0:
+            lines.append("")
+
+    lines.append(thick)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Ratio CSV formatter
+# ---------------------------------------------------------------------------
+
+def format_ratio_csv(report: RatioReport) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    writer.writerow(["Company", report.company_name])
+    writer.writerow(["Ticker", report.ticker])
+    writer.writerow(["Statement", report.statement_title])
+    writer.writerow(["Period", "Annual" if report.period == "annual" else "Quarterly"])
+    if report.price:
+        writer.writerow(["Price", report.price])
+    writer.writerow([])
+
+    writer.writerow(["Metric", "Metric ID", "Format"] + list(report.periods))
+
+    for row in report.rows:
+        if row.is_section_header:
+            writer.writerow([f"--- {row.section_label} ---"])
+            continue
+        raw_vals = [row.values.get(p) for p in report.periods]
+        writer.writerow([row.display, row.metric_name, row.fmt] + [
+            "" if v is None else round(v, 4) for v in raw_vals
+        ])
+
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Patch write_excel to also handle RatioReport
+# ---------------------------------------------------------------------------
+
+def _write_ratio_sheet(ws, report: RatioReport, styles: dict) -> None:
+    """Write a RatioReport into an existing openpyxl worksheet."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    HEADER_FILL = styles["HEADER_FILL"]
+    HEADER_FONT = styles["HEADER_FONT"]
+    SECTION_FILL = styles["SECTION_FILL"]
+    SECTION_FONT = styles["SECTION_FONT"]
+    TOTAL_FONT = styles["TOTAL_FONT"]
+    DETAIL_FONT = styles["DETAIL_FONT"]
+    ALT_FILL = styles["ALT_FILL"]
+    TITLE_FONT = styles["TITLE_FONT"]
+    SUBTITLE_FONT = styles["SUBTITLE_FONT"]
+
+    price_str = f"  ·  Price ${report.price:,.2f}" if report.price else ""
+    ws["A1"] = f"{report.company_name} ({report.ticker})"
+    ws["A1"].font = TITLE_FONT
+    granularity = "Annual" if report.period == "annual" else "Quarterly"
+    ws["A2"] = f"{report.statement_title}  ·  {granularity}{price_str}"
+    ws["A2"].font = SUBTITLE_FONT
+    ws.append([])
+
+    header_row = ["", "Metric ID", "Format"] + list(report.periods)
+    ws.append(header_row)
+    hdr_row_num = ws.max_row
+    for col_idx, _ in enumerate(header_row, 1):
+        cell = ws.cell(row=hdr_row_num, column=col_idx)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="right" if col_idx > 3 else "left")
+    ws.freeze_panes = ws.cell(row=hdr_row_num + 1, column=4)
+
+    data_row_num = hdr_row_num
+    alt = False
+    for row in report.rows:
+        data_row_num += 1
+        if row.is_section_header:
+            ws.cell(row=data_row_num, column=1, value=row.section_label)
+            for c in range(1, 4 + len(report.periods)):
+                cell = ws.cell(row=data_row_num, column=c)
+                cell.fill = SECTION_FILL
+                cell.font = SECTION_FONT
+            alt = False
+            continue
+
+        indent_str = "    " * row.indent
+        ws.cell(row=data_row_num, column=1, value=indent_str + row.display)
+        ws.cell(row=data_row_num, column=2, value=row.metric_name)
+        ws.cell(row=data_row_num, column=3, value=row.fmt)
+        row_font = TOTAL_FONT if row.indent == 0 else DETAIL_FONT
+        ws.cell(row=data_row_num, column=1).font = row_font
+
+        if alt:
+            for c in range(1, 4 + len(report.periods)):
+                ws.cell(row=data_row_num, column=c).fill = ALT_FILL
+
+        for col_offset, p in enumerate(report.periods):
+            v = row.values.get(p)
+            col_num = 4 + col_offset
+            cell = ws.cell(row=data_row_num, column=col_num)
+            if v is not None:
+                cell.value = round(v, 4)
+                if row.fmt == "percent":
+                    cell.value = round(v / 100, 4)  # Excel % format expects 0-1 fraction
+                    cell.number_format = '0.0%'
+                elif row.fmt in ("times", "multiple"):
+                    cell.number_format = '0.0x'
+                elif row.fmt == "days":
+                    cell.number_format = '0'
+                elif row.fmt == "currency":
+                    cell.value = round(v / report.scale, 2)
+                    cell.number_format = '#,##0.0'
+                elif row.fmt == "currency_per_share":
+                    cell.number_format = '$#,##0.00'
+            cell.font = row_font
+            cell.alignment = Alignment(horizontal="right")
+
+        alt = not alt
+
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 28
+    ws.column_dimensions["C"].width = 12
+    for col_offset in range(len(report.periods)):
+        ws.column_dimensions[get_column_letter(4 + col_offset)].width = 14
+
+
+def write_excel(reports, output_path: str) -> None:
+    """Write a list of Report and/or RatioReport objects to an Excel workbook."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise ImportError(
+            "openpyxl is required for Excel export. Install with: pip install openpyxl"
+        )
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    styles = {
+        "HEADER_FILL": PatternFill("solid", fgColor="1F3864"),
+        "HEADER_FONT": Font(color="FFFFFF", bold=True, size=10),
+        "SECTION_FILL": PatternFill("solid", fgColor="D9E1F2"),
+        "SECTION_FONT": Font(bold=True, size=9, color="1F3864"),
+        "TOTAL_FONT": Font(bold=True, size=9),
+        "DETAIL_FONT": Font(size=9),
+        "TITLE_FONT": Font(bold=True, size=12),
+        "SUBTITLE_FONT": Font(size=9, italic=True),
+        "ALT_FILL": PatternFill("solid", fgColor="F5F7FA"),
+    }
+
+    for report in reports:
+        sheet_name = report.statement_title[:31]
+        ws = wb.create_sheet(title=sheet_name)
+
+        if isinstance(report, RatioReport):
+            _write_ratio_sheet(ws, report, styles)
+            continue
+
+        # --- Original Report sheets (unchanged logic, refactored to use styles dict) ---
+        ws["A1"] = f"{report.company_name} ({report.ticker})"
+        ws["A1"].font = styles["TITLE_FONT"]
+        granularity = "Annual" if report.period == "annual" else "Quarterly"
+        ws["A2"] = f"{report.statement_title}  ·  {granularity}  ·  {_scale_label(report.scale)}"
+        ws["A2"].font = styles["SUBTITLE_FONT"]
+        ws.append([])
+
+        header_row = ["", "Metric ID", "Unit"] + list(report.periods)
+        ws.append(header_row)
+        hdr_row_num = ws.max_row
+        for col_idx, _ in enumerate(header_row, 1):
+            cell = ws.cell(row=hdr_row_num, column=col_idx)
+            cell.fill = styles["HEADER_FILL"]
+            cell.font = styles["HEADER_FONT"]
+            cell.alignment = Alignment(horizontal="right" if col_idx > 3 else "left")
+        ws.freeze_panes = ws.cell(row=hdr_row_num + 1, column=4)
+
+        data_row_num = hdr_row_num
+        alt = False
+        for row in report.rows:
+            data_row_num += 1
+            if row.is_section_header:
+                ws.cell(row=data_row_num, column=1, value=row.section_label)
+                for c in range(1, 4 + len(report.periods)):
+                    cell = ws.cell(row=data_row_num, column=c)
+                    cell.fill = styles["SECTION_FILL"]
+                    cell.font = styles["SECTION_FONT"]
+                alt = False
+                continue
+
+            m = row.metric
+            indent_str = "    " * m.indent
+            label_cell = ws.cell(row=data_row_num, column=1, value=indent_str + m.display)
+            ws.cell(row=data_row_num, column=2, value=m.name)
+            ws.cell(row=data_row_num, column=3, value=m.unit)
+            row_font = styles["TOTAL_FONT"] if m.indent == 0 else styles["DETAIL_FONT"]
+            label_cell.font = row_font
+
+            if alt:
+                for c in range(1, 4 + len(report.periods)):
+                    ws.cell(row=data_row_num, column=c).fill = styles["ALT_FILL"]
+
+            for col_offset, p in enumerate(report.periods):
+                v = row.values.get(p)
+                col_num = 4 + col_offset
+                cell = ws.cell(row=data_row_num, column=col_num)
+                if v is not None:
+                    if m.unit == "USD":
+                        cell.value = round(v / report.scale, 2)
+                        cell.number_format = '#,##0.0'
+                    elif m.unit == "shares":
+                        cell.value = round(v / 1_000_000, 2)
+                        cell.number_format = '#,##0.0'
+                    elif m.unit == "USD/shares":
+                        cell.value = round(v, 2)
+                        cell.number_format = '0.00'
+                    else:
+                        cell.value = v
+                        cell.number_format = '#,##0.00'
+                cell.font = row_font
+                cell.alignment = Alignment(horizontal="right")
+            alt = not alt
+
+        ws.column_dimensions["A"].width = 38
+        ws.column_dimensions["B"].width = 30
+        ws.column_dimensions["C"].width = 12
+        for col_offset in range(len(report.periods)):
+            ws.column_dimensions[get_column_letter(4 + col_offset)].width = 14
 
     wb.save(output_path)

@@ -217,7 +217,7 @@ def info(ctx: click.Context, ticker: str) -> None:
 # ---------------------------------------------------------------------------
 
 STATEMENT_CHOICES = click.Choice(
-    ["income-statement", "balance-sheet", "cash-flow", "all"],
+    ["income-statement", "balance-sheet", "cash-flow", "ratios", "all"],
     case_sensitive=False,
 )
 
@@ -283,6 +283,12 @@ SCALE_MAP = {
     default=None,
     help="Output directory when generating multiple files (multi-ticker csv/excel).",
 )
+@click.option(
+    "--price",
+    type=float,
+    default=None,
+    help="Current stock price. Unlocks market multiples (P/E, EV/EBITDA, etc.).",
+)
 @click.pass_context
 def report(
     ctx: click.Context,
@@ -295,6 +301,7 @@ def report(
     scale: str,
     output: Optional[str],
     output_dir: Optional[str],
+    price: Optional[float],
 ) -> None:
     """
     Generate standardized Income Statement, Balance Sheet, or Cash Flow report.
@@ -317,7 +324,8 @@ def report(
         "income-statement": ["income_statement"],
         "balance-sheet": ["balance_sheet"],
         "cash-flow": ["cash_flow"],
-        "all": ["income_statement", "balance_sheet", "cash_flow"],
+        "ratios": ["ratios"],
+        "all": ["income_statement", "balance_sheet", "cash_flow", "ratios"],
     }
     statements = stmt_map[statement.lower()]
 
@@ -330,6 +338,7 @@ def report(
                 period=period,
                 num_periods=num_periods,
                 scale=scale_divisor,
+                price=price,
             )
         except ValueError as e:
             click.echo(f"[ERROR] {e}", err=True)
@@ -339,7 +348,10 @@ def report(
             dest = output or "-"
             out_fh = open(dest, "w") if dest != "-" else None
             for rpt in rpts:
-                text = reports_mod.format_text(rpt)
+                if isinstance(rpt, reports_mod.RatioReport):
+                    text = reports_mod.format_ratio_text(rpt)
+                else:
+                    text = reports_mod.format_text(rpt)
                 if out_fh:
                     out_fh.write(text + "\n\n")
                 else:
@@ -357,7 +369,10 @@ def report(
                     stmt_slug = rpt.statement.replace("_", "-")
                     filename = f"{ticker.upper()}_{stmt_slug}.csv"
                     dest = os.path.join(output_dir or ".", filename)
-                csv_text = reports_mod.format_csv(rpt)
+                if isinstance(rpt, reports_mod.RatioReport):
+                    csv_text = reports_mod.format_ratio_csv(rpt)
+                else:
+                    csv_text = reports_mod.format_csv(rpt)
                 if dest == "-" or (output is None and output_dir is None and len(tickers) == 1 and len(statements) == 1):
                     click.echo(csv_text)
                 else:
