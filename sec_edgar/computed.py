@@ -199,14 +199,19 @@ class YoYGrowth(ComputedMetric):
         return [self.metric]
 
     def compute(self, data: Data, periods: List[str], price=None) -> PeriodValues:
+        # Annual: compare period[i] vs period[i-1] (one year back)
+        # Quarterly: compare period[i] vs period[i-4] (same quarter last year)
+        is_quarterly = bool(periods) and not periods[0].startswith("FY")
+        lookback = 4 if is_quarterly else 1
+
         result: PeriodValues = {}
         for i, p in enumerate(periods):
-            if i == 0:
+            if i < lookback:
                 result[p] = None
             else:
                 raw = _safe_growth(
                     _get(data, self.metric, p),
-                    _get(data, self.metric, periods[i - 1]),
+                    _get(data, self.metric, periods[i - lookback]),
                 )
                 result[p] = raw * 100 if raw is not None else None
         return result

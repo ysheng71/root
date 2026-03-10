@@ -60,6 +60,10 @@ class ReportRow:
     values: Dict[str, Optional[float]]  # period_label -> raw value (unscaled)
     is_section_header: bool = False
     section_label: str = ""
+    # Annotation rows: computed metrics injected after their parent metric row
+    is_annotation: bool = False
+    annotation_display: str = ""   # display name (e.g. "· Revenue Growth (YoY)")
+    annotation_fmt: str = ""       # fmt key for _fmt_ratio_value
 
 
 @dataclass
@@ -214,7 +218,11 @@ def build_report(
     period: str,
     num_periods: int,
     scale: int = 1_000_000,
+    annotation_pool: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
 ) -> Report:
+    from .annotation_defs import get_annotations
+    from .ratio_defs import ALL_COMPUTED
+
     metrics = STATEMENT_METRICS[statement]
 
     # Fetch raw facts
@@ -229,6 +237,10 @@ def build_report(
             derived_vals = _compute_derived(m, periods, facts)
             for p, v in derived_vals.items():
                 facts[(m.name, p)] = v
+
+    # Build annotation metadata lookup: name → (display, fmt)
+    ann_meta: Dict[str, tuple] = {m.name: (m.display, m.fmt) for m in ALL_COMPUTED}
+    annotations = get_annotations(statement, period) if annotation_pool else {}
 
     # Build rows with section headers
     rows: List[ReportRow] = []
@@ -247,6 +259,18 @@ def build_report(
 
         row_values = {p: facts.get((m.name, p)) for p in periods}
         rows.append(ReportRow(metric=m, values=row_values))
+
+        # Inject annotation rows immediately after this metric
+        for ann_name in annotations.get(m.name, []):
+            display, fmt = ann_meta.get(ann_name, (ann_name, "raw"))
+            ann_vals = {p: annotation_pool.get(ann_name, {}).get(p) for p in periods}
+            rows.append(ReportRow(
+                metric=m,
+                values=ann_vals,
+                is_annotation=True,
+                annotation_display=display,
+                annotation_fmt=fmt,
+            ))
 
     return Report(
         company_name=company_name,
@@ -278,9 +302,17 @@ def build_reports(
     scale: int = 1_000_000,
     price: Optional[float] = None,
 ) -> List[Report]:
+    from .computed import RatioEngine
+    from .ratio_defs import ALL_COMPUTED
+
     company = _get_company(conn, ticker)
     if not company:
         raise ValueError(f"Ticker '{ticker}' not found in database. Run 'fetch' first.")
+
+    # Build unified metric pool once — shared by annotations and the ratio report
+    full_pool, ann_periods = fetch_all_metrics(conn, company["cik"], period, num_periods)
+    engine = RatioEngine()
+    annotation_pool = engine.compute_all(ALL_COMPUTED, full_pool, ann_periods, price=price)
 
     reports = []
     for stmt in statements:
@@ -294,6 +326,8 @@ def build_reports(
                 num_periods=num_periods,
                 scale=scale,
                 price=price,
+                prebuilt_pool=annotation_pool,
+                prebuilt_periods=ann_periods,
             )
         else:
             r = build_report(
@@ -305,6 +339,7 @@ def build_reports(
                 period=period,
                 num_periods=num_periods,
                 scale=scale,
+                annotation_pool=annotation_pool,
             )
         reports.append(r)
     return reports
@@ -370,6 +405,16 @@ def format_text(report: Report) -> str:
             lines.append(sep)
             continue
 
+        if row.is_annotation:
+            label = ("    · " + row.annotation_display)[:LABEL_WIDTH].ljust(LABEL_WIDTH)
+            vals = ""
+            for p in report.periods:
+                vals += _fmt_ratio_value(
+                    row.values.get(p), row.annotation_fmt, report.scale
+                ).rjust(COL_WIDTH)
+            lines.append(label + vals)
+            continue
+
         m = row.metric
         prefix = "  " + ("  " if m.indent else "")
         label = prefix + m.display
@@ -380,9 +425,7 @@ def format_text(report: Report) -> str:
         for p in report.periods:
             vals += _fmt_value(row.values.get(p), m.unit, report.scale).rjust(COL_WIDTH)
 
-        # Bold total / header lines (indent=0, not section header) with underline char
-        line = label + vals
-        lines.append(line)
+        lines.append(label + vals)
 
         # Add blank line after major totals for readability
         if m.indent == 0 and m.section not in ("revenue",):
@@ -414,6 +457,13 @@ def format_csv(report: Report) -> str:
     for row in report.rows:
         if row.is_section_header:
             writer.writerow([f"--- {row.section_label} ---"])
+            continue
+        if row.is_annotation:
+            raw_vals = [row.values.get(p) for p in report.periods]
+            writer.writerow(
+                ["· " + row.annotation_display, "", row.annotation_fmt]
+                + ["" if v is None else round(v, 4) for v in raw_vals]
+            )
             continue
         m = row.metric
         raw_vals = [row.values.get(p) for p in report.periods]
@@ -653,16 +703,21 @@ def build_ratio_report(
     num_periods: int,
     scale: int = 1_000_000,
     price: Optional[float] = None,
+    prebuilt_pool: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
+    prebuilt_periods: Optional[List[str]] = None,
 ) -> RatioReport:
     from .computed import RatioEngine
     from .ratio_defs import ALL_COMPUTED, VISIBLE_COMPUTED, SECTION_TITLES, SECTION_ORDER
 
-    # Build base data pool
-    pool, periods = fetch_all_metrics(conn, cik, period, num_periods)
-
-    # Run the ratio engine (evaluates ALL_COMPUTED in order, growing the pool)
-    engine = RatioEngine()
-    pool = engine.compute_all(ALL_COMPUTED, pool, periods, price=price)
+    if prebuilt_pool is not None and prebuilt_periods is not None:
+        pool = prebuilt_pool
+        periods = prebuilt_periods
+    else:
+        # Build base data pool
+        pool, periods = fetch_all_metrics(conn, cik, period, num_periods)
+        # Run the ratio engine (evaluates ALL_COMPUTED in order, growing the pool)
+        engine = RatioEngine()
+        pool = engine.compute_all(ALL_COMPUTED, pool, periods, price=price)
 
     # Build rows grouped by section
     rows: List[RatioRow] = []
@@ -951,6 +1006,8 @@ def write_excel(reports, output_path: str) -> None:
             cell.alignment = Alignment(horizontal="right" if col_idx > 3 else "left")
         ws.freeze_panes = ws.cell(row=hdr_row_num + 1, column=4)
 
+        ANNOT_FONT = Font(size=9, italic=True, color="555555")
+
         data_row_num = hdr_row_num
         alt = False
         for row in report.rows:
@@ -962,6 +1019,20 @@ def write_excel(reports, output_path: str) -> None:
                     cell.fill = styles["SECTION_FILL"]
                     cell.font = styles["SECTION_FONT"]
                 alt = False
+                continue
+
+            if row.is_annotation:
+                ws.cell(row=data_row_num, column=1,
+                        value="  · " + row.annotation_display).font = ANNOT_FONT
+                for col_offset, p in enumerate(report.periods):
+                    v = row.values.get(p)
+                    col_num = 4 + col_offset
+                    cell = ws.cell(row=data_row_num, column=col_num)
+                    if v is not None:
+                        cell.value = round(v / 100, 4) if row.annotation_fmt == "percent" else round(v, 4)
+                        cell.number_format = '0.0%' if row.annotation_fmt == "percent" else '0.00'
+                    cell.font = ANNOT_FONT
+                    cell.alignment = Alignment(horizontal="right")
                 continue
 
             m = row.metric

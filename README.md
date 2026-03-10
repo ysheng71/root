@@ -1,8 +1,13 @@
 # sec-edgar
 
 Downloads 10-K/10-Q filings from the SEC EDGAR API, parses XBRL data, and stores
-everything in a local SQLite database. Generates standardized Income Statement,
-Balance Sheet, and Cash Flow reports for any publicly traded US company.
+everything in a local SQLite database. Generates standardized financial reports for
+any publicly traded US company:
+
+- **Income Statement, Balance Sheet, Cash Flow** — with inline computed annotations
+  (margins, growth rates, key ratios displayed inline as `·` rows)
+- **Ratios & Valuation** — 50+ metrics across profitability, liquidity, leverage,
+  efficiency, cash flow quality, growth, and market multiples
 
 ## Installation
 
@@ -67,29 +72,36 @@ sec-edgar --db ~/portfolios/tech.db fetch AAPL MSFT GOOGL
 
 ---
 
-### `report` — Standardized financial statements
+### `report` — Standardized financial statements & ratios
 
-Generates Income Statement, Balance Sheet, and/or Cash Flow Statement using
-standardized metric names mapped from raw XBRL concepts.
+Generates financial reports using standardized metric names mapped from raw XBRL
+concepts. Financial statements include **inline annotations** (margins, growth rates,
+key ratios) displayed as `·` rows directly below their parent line items.
 
 **Output formats:** `text` (terminal), `csv` (file), `excel` (.xlsx workbook)
 
 #### Text output (default)
 
 ```bash
-# All three statements, annual, last 5 years
+# All statements + ratios, annual, last 5 years
 sec-edgar report AAPL
 
-# Income Statement only
+# Income Statement only (with inline margin & growth annotations)
 sec-edgar report AAPL --statement income-statement
 
-# Balance Sheet, last 4 years
+# Balance Sheet (with inline liquidity & return annotations)
 sec-edgar report AAPL --statement balance-sheet --years 4
 
-# Cash Flow Statement
+# Cash Flow Statement (with inline margin & growth annotations)
 sec-edgar report AAPL --statement cash-flow
 
-# Quarterly view, most recent 8 quarters (default)
+# Ratios & Valuation report (50+ metrics: profitability, leverage, efficiency, growth)
+sec-edgar report AAPL --statement ratios
+
+# Ratios with market multiples (P/E, EV/EBITDA, etc.)
+sec-edgar report AAPL --statement ratios --price 213.50
+
+# Quarterly view, most recent 8 quarters — YoY growth compares same quarter last year
 sec-edgar report AAPL --period quarterly
 
 # Quarterly, last 6 quarters
@@ -105,6 +117,56 @@ sec-edgar report AAPL --statement balance-sheet --scale raw
 sec-edgar report AAPL -o AAPL_report.txt
 ```
 
+#### Inline annotations
+
+Financial statement reports include `·` annotation rows beneath key line items:
+
+**Income Statement**
+- Revenue → `· Revenue Growth (YoY)` [+ `· Revenue Growth (QoQ)` in quarterly mode]
+- Gross Profit → `· Gross Margin`
+- R&D / SG&A → `· R&D % of Revenue` / `· SG&A % of Revenue`
+- Operating Income → `· Operating Margin` [+ `· EBIT Growth (QoQ)`]
+- EBITDA → `· EBITDA Margin`
+- Net Income → `· Net Margin` [+ `· Net Income Growth (QoQ)`]
+- EPS Diluted → `· EPS Growth (YoY)` [+ `· EPS Growth (QoQ)`]
+
+**Balance Sheet**
+- Total Current Assets → `· Current Ratio`, `· Quick Ratio`, `· Cash Ratio`
+- Total Current Liabilities → `· Working Capital`
+- Total Assets → `· ROA`, `· Debt / Assets`, `· Asset Turnover`
+- Long-term Debt → `· Net Debt / EBITDA`, `· Interest Coverage`
+- Total Equity → `· ROE`, `· Book Value per Share`, `· Debt / Equity`, `· Equity Multiplier`
+
+**Cash Flow Statement**
+- Net Cash from Operations → `· Operating CF Margin`, `· Operating CF Growth (YoY)` [+ QoQ]
+- Free Cash Flow → `· FCF Margin`, `· FCF Growth (YoY)` [+ QoQ]
+- Stock-based Compensation → `· SBC / Revenue`
+- Share Repurchases → `· Repurchases / Revenue`
+- Dividends Paid → `· Dividends / Revenue`
+
+#### Ratios & Valuation report
+
+The `ratios` statement generates a dedicated report with 50+ computed metrics,
+grouped by section:
+
+| Section | Metrics |
+|---|---|
+| **Profitability** | Gross/Operating/EBITDA/Net Margin, ROE, ROA, ROIC, R&D %, SG&A % |
+| **Liquidity** | Working Capital, Current/Quick/Cash Ratio |
+| **Leverage & Solvency** | Total/Net Debt, D/E, Net Debt/EBITDA, Interest Coverage, Equity Multiplier |
+| **Efficiency** | Asset/Inventory/Receivables Turnover, DSO, DIO, DPO, CCC, Capex/Revenue |
+| **Cash Flow Quality** | Operating CF Margin, FCF Margin, FCF/NI, FCF per Share, SBC/Revenue, Repurchases/Revenue, Dividends/Revenue |
+| **Per Share** | Book Value, Tangible Book Value, Revenue per Share |
+| **Growth** | YoY & QoQ growth for Revenue/EBIT/NI/EPS/FCF/Operating CF; Revenue/NI/EPS/FCF CAGR |
+| **Market Multiples** | P/E, P/S, P/B, P/FCF, EV/Revenue, EV/EBITDA, EV/EBIT, EV/FCF, Earnings Yield, FCF Yield |
+
+Market multiples require `--price`:
+
+```bash
+sec-edgar report AAPL --statement ratios --price 213.50
+sec-edgar report AAPL --statement all --price 213.50 --format excel -o AAPL_full.xlsx
+```
+
 #### CSV output
 
 ```bash
@@ -114,11 +176,7 @@ sec-edgar report AAPL --statement income-statement --format csv
 # Single statement to a file
 sec-edgar report AAPL --statement income-statement --format csv -o AAPL_income.csv
 
-# All three statements — creates AAPL_income-statement.csv,
-# AAPL_balance-sheet.csv, AAPL_cash-flow.csv in current directory
-sec-edgar report AAPL --statement all --format csv
-
-# Save to a specific directory
+# All statements + ratios — one file per statement
 sec-edgar report AAPL --statement all --format csv --output-dir ./reports/
 
 # Multiple tickers — one file per ticker/statement combination
@@ -130,19 +188,22 @@ sec-edgar report AAPL --statement cash-flow --period quarterly --quarters 8 \
 ```
 
 The CSV includes metadata rows at the top (company, ticker, statement name, period,
-scale) followed by a data table with columns: `Metric`, `Metric ID`, `Unit`, and one
-column per period.
+scale) followed by a data table. Annotation rows (`·`) appear inline with their
+parent metric, with no `Metric ID` (computed values only).
 
 #### Excel output
 
 ```bash
-# All statements in a single workbook (one sheet per statement)
+# All statements + ratios in a single workbook (one sheet each)
 sec-edgar report AAPL --format excel -o AAPL_financials.xlsx
+
+# With market multiples
+sec-edgar report AAPL --format excel --price 213.50 -o AAPL_full.xlsx
 
 # Annual income statement only
 sec-edgar report AAPL --statement income-statement --format excel -o AAPL_IS.xlsx
 
-# Quarterly, all statements
+# Quarterly, all statements + ratios
 sec-edgar report AAPL --statement all --period quarterly --quarters 8 \
   --format excel -o AAPL_quarterly.xlsx
 
@@ -155,18 +216,20 @@ sec-edgar report AAPL --years 10 --format excel -o AAPL_10yr.xlsx
 ```
 
 Excel workbooks have:
-- One sheet per statement (Income Statement, Balance Sheet, Cash Flow Statement)
+- One sheet per statement (Income Statement, Balance Sheet, Cash Flow, Ratios & Valuation)
+- Annotation rows in italic grey — visually distinct from accounting line items
 - Formatted headers, number formatting, alternating row shading
 - Frozen header row and label column for easy scrolling
 
 #### `--statement` values
 
-| Value              | Description                        |
-|--------------------|------------------------------------|
-| `all` (default)    | All three statements               |
-| `income-statement` | Revenue, expenses, net income      |
-| `balance-sheet`    | Assets, liabilities, equity        |
-| `cash-flow`        | Operating, investing, financing CF |
+| Value              | Description                                          |
+|--------------------|------------------------------------------------------|
+| `all` (default)    | All three statements + Ratios & Valuation            |
+| `income-statement` | Revenue, expenses, net income (with annotations)     |
+| `balance-sheet`    | Assets, liabilities, equity (with annotations)       |
+| `cash-flow`        | Operating, investing, financing CF (with annotations)|
+| `ratios`           | 50+ computed ratios, growth metrics, market multiples|
 
 #### `--scale` values
 
@@ -279,10 +342,12 @@ sec-edgar info AAPL
 
 # 4. View reports in terminal
 sec-edgar report AAPL
+sec-edgar report AAPL --statement ratios --price 213.50
 sec-edgar report AAPL --statement cash-flow --period quarterly
 
 # 5. Export for further analysis
 sec-edgar report AAPL MSFT GOOGL --statement all --format excel --output-dir ./reports/
+sec-edgar report AAPL --statement all --price 213.50 --format excel -o AAPL_full.xlsx
 
 # 6. Re-run fetch anytime to pick up new filings — already-fetched data is skipped
 sec-edgar fetch AAPL MSFT GOOGL AMZN NVDA META
