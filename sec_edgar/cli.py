@@ -61,7 +61,7 @@ def cli(ctx: click.Context, db_path: str, user_agent: str) -> None:
 
 
 @cli.command()
-@click.argument("tickers", nargs=-1, required=True)
+@click.argument("tickers", nargs=-1, required=False)
 @click.option(
     "--forms",
     default="10-K,10-Q,10-K/A,10-Q/A",
@@ -70,6 +70,11 @@ def cli(ctx: click.Context, db_path: str, user_agent: str) -> None:
 )
 @click.option("--dry-run", is_flag=True, help="Show what would be done without writing.")
 @click.option("--verbose", "-v", is_flag=True)
+@click.option(
+    "--all", "fetch_all",
+    is_flag=True,
+    help="Refresh all tickers already in the database.",
+)
 @click.pass_context
 def fetch(
     ctx: click.Context,
@@ -77,8 +82,24 @@ def fetch(
     forms: str,
     dry_run: bool,
     verbose: bool,
+    fetch_all: bool,
 ) -> None:
-    """Download filings metadata and XBRL facts for one or more TICKERS."""
+    """Download filings metadata and XBRL facts for one or more TICKERS.
+
+    Use --all to refresh every ticker already in the database.
+    """
+    if fetch_all:
+        conn = db_mod.get_connection(ctx.obj["db_path"])
+        rows = db_mod.list_companies(conn)
+        if not rows:
+            click.echo("No companies in database. Run 'fetch TICKER' first.", err=True)
+            sys.exit(1)
+        tickers = tuple(r["ticker"] for r in rows)
+        click.echo(f"Refreshing {len(tickers)} ticker(s): {', '.join(tickers)}")
+    elif not tickers:
+        click.echo("Error: provide at least one TICKER or use --all.", err=True)
+        sys.exit(1)
+
     form_types = [f.strip() for f in forms.split(",") if f.strip()]
     edgar_client = EdgarClient(user_agent=ctx.obj["user_agent"])
     pipeline.run(

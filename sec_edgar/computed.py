@@ -201,7 +201,7 @@ class YoYGrowth(ComputedMetric):
     def compute(self, data: Data, periods: List[str], price=None) -> PeriodValues:
         # Annual: compare period[i] vs period[i-1] (one year back)
         # Quarterly: compare period[i] vs period[i-4] (same quarter last year)
-        is_quarterly = bool(periods) and not periods[0].startswith("FY")
+        is_quarterly = bool(periods) and any("Q" in p for p in periods if p != "LTM")
         lookback = 4 if is_quarterly else 1
 
         result: PeriodValues = {}

@@ -172,7 +172,7 @@ def _fetch_facts(
                     f.filed_date,
                     ROW_NUMBER() OVER (
                         PARTITION BY mm.metric_name, f.fiscal_year, f.fiscal_period
-                        ORDER BY mm.priority ASC, f.filed_date DESC
+                        ORDER BY mm.priority ASC, f.period_end DESC, f.filed_date DESC
                     ) AS rn
                 FROM xbrl_facts f
                 JOIN metric_mappings mm
@@ -316,6 +316,7 @@ def _fetch_ltm(
                    AND mm.statement = :stmt AND f.unit = mm.unit
             WHERE f.cik = :cik AND f.form IN ('10-K', '10-K/A')
               AND f.fiscal_period = 'FY'
+              AND f.filed_date >= date('now', '-10 years')
               AND f.value IS NOT NULL
         )
         SELECT metric_name, period_type, period_end, value FROM ranked WHERE rn = 1
@@ -910,13 +911,15 @@ def fetch_all_metrics(
                     result[p] = None
             pool[m.name] = result
 
-    # Add LTM column for annual reports
+    # Add LTM column for annual reports — inject incrementally to preserve derived metrics
     if period == "annual":
         for stmt in ("income_statement", "balance_sheet", "cash_flow"):
             for name, val in _fetch_ltm(conn, cik, stmt).items():
-                all_flat[(name, "LTM")] = val
+                pool.setdefault(name, {})["LTM"] = val
+        # Ensure every existing metric has an LTM key (None if not fetched)
+        for name in list(pool.keys()):
+            pool[name].setdefault("LTM", None)
         all_periods = all_periods + ["LTM"]
-        pool = _pool_from_flat(all_flat, all_periods)
         for m in ALL_METRICS:
             if m.is_derived and m.derived_expr:
                 pool.setdefault(m.name, {})["LTM"] = _eval_derived_for_period(

@@ -61,14 +61,24 @@ sec-edgar fetch AAPL --dry-run
 # Show detailed output (total facts parsed per company)
 sec-edgar fetch AAPL MSFT --verbose
 
+# Refresh every ticker already in the database (e.g. as a nightly cron job)
+sec-edgar fetch --all
+
+# Dry-run to see which tickers would be refreshed
+sec-edgar fetch --all --dry-run
+
 # Use a non-default database file
 sec-edgar --db ~/portfolios/tech.db fetch AAPL MSFT GOOGL
+
+# Refresh all tickers in a non-default database
+sec-edgar --db ~/portfolios/tech.db fetch --all
 ```
 
 **Notes:**
 - The SEC rate-limits requests to 10/second; the tool stays safely under that limit.
 - On first run for a company, one API call fetches the full XBRL history (~5–20 MB).
 - Subsequent runs skip the XBRL fetch if all filings are already up to date.
+- `--all` reads the ticker list from the `companies` table; run `sec-edgar ls` to see what is in the database.
 
 ---
 
@@ -351,6 +361,9 @@ sec-edgar report AAPL --statement all --price 213.50 --format excel -o AAPL_full
 
 # 6. Re-run fetch anytime to pick up new filings — already-fetched data is skipped
 sec-edgar fetch AAPL MSFT GOOGL AMZN NVDA META
+
+# Or use --all to refresh every ticker already in the database at once
+sec-edgar fetch --all
 ```
 
 ---

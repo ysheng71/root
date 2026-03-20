@@ -24,3 +24,6 @@ build/
 
 # Claude Code internal
 .claude/
+
+# Working notes
+KNOWN_BUGS.md
