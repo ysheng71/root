@@ -148,32 +148,30 @@ def _fetch_facts(
             ORDER BY metric_name, {sort_col}
         """
     else:
-        form_values = "('10-Q', '10-Q/A')"
-        period_values = "('Q1', 'Q2', 'Q3', 'Q4')"
         year_limit = (num_periods // 4) + 3
-        period_key_expr = "printf('%d %s', f.fiscal_year, f.fiscal_period)"
         sort_col = "period_end"
         sql = f"""
             WITH min_year AS (
                 SELECT MAX(fiscal_year) - {year_limit} AS cutoff
                 FROM xbrl_facts
                 WHERE cik = :cik
-                  AND form IN {form_values}
+                  AND form IN ('10-Q', '10-Q/A', '10-K', '10-K/A')
             ),
-            ranked AS (
+            -- Include 10-Q (Q1/Q2/Q3) and 10-K annual (treated as Q4) so that
+            -- fiscal year-end periods (9/30, 12/31, etc.) appear in the quarterly series.
+            -- FY rows are normalized to fiscal_period='Q4' for deduplication and LAG.
+            all_rows AS (
                 SELECT
                     mm.metric_name,
-                    mm.priority    AS concept_priority,
-                    {period_key_expr} AS period_label,
+                    mm.period_type,
+                    mm.priority,
                     f.fiscal_year,
-                    f.fiscal_period,
+                    CASE WHEN f.fiscal_period = 'FY' THEN 'Q4'
+                         ELSE f.fiscal_period END AS fiscal_period,
+                    f.period_start,
                     f.period_end,
                     f.value,
-                    f.filed_date,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY mm.metric_name, f.fiscal_year, f.fiscal_period
-                        ORDER BY mm.priority ASC, f.period_end DESC, f.filed_date DESC
-                    ) AS rn
+                    f.filed_date
                 FROM xbrl_facts f
                 JOIN metric_mappings mm
                     ON  mm.concept   = f.concept
@@ -182,15 +180,70 @@ def _fetch_facts(
                     AND f.unit       = mm.unit
                 CROSS JOIN min_year
                 WHERE f.cik = :cik
-                  AND f.form IN {form_values}
-                  AND f.fiscal_period IN {period_values}
+                  AND f.form IN ('10-Q', '10-Q/A', '10-K', '10-K/A')
+                  AND f.fiscal_period IN ('Q1', 'Q2', 'Q3', 'Q4', 'FY')
                   AND f.fiscal_year >= min_year.cutoff
                   AND f.value IS NOT NULL
+            ),
+            -- Pick the best concept row per (metric, fiscal_year, fiscal_period)
+            ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY metric_name, fiscal_year, fiscal_period
+                        ORDER BY priority ASC, period_end DESC, filed_date DESC
+                    ) AS rn
+                FROM all_rows
+            ),
+            best AS (
+                SELECT * FROM ranked WHERE rn = 1
+            ),
+            -- Mark duration rows whose period_start equals the fiscal-year start as YTD.
+            -- Q1/Q2/Q3 YTD facts all share the same period_start (start of fiscal year).
+            -- Q4 filed as a standalone 3-month 10-Q has a different period_start.
+            flagged AS (
+                SELECT
+                    b.*,
+                    CASE
+                        WHEN b.period_type = 'duration'
+                             AND b.period_start = MIN(b.period_start) OVER (
+                                     PARTITION BY b.metric_name, b.fiscal_year
+                                 )
+                        THEN 1 ELSE 0
+                    END AS is_ytd
+                FROM best b
+            ),
+            -- Convert YTD cumulative values to standalone quarter values by
+            -- subtracting the prior quarter's YTD (LAG within the same YTD group).
+            -- Instant metrics are snapshots and are used directly.
+            standalone AS (
+                SELECT
+                    metric_name,
+                    period_end,
+                    CASE
+                        WHEN is_ytd = 1 THEN
+                            value - COALESCE(
+                                LAG(value) OVER (
+                                    PARTITION BY metric_name, fiscal_year, is_ytd
+                                    ORDER BY period_end
+                                ),
+                                0.0
+                            )
+                        ELSE value
+                    END AS value
+                FROM flagged
             )
-            SELECT metric_name, period_label, fiscal_year, fiscal_period,
-                   period_end, value
-            FROM ranked
-            WHERE rn = 1
+            SELECT
+                metric_name,
+                printf('%d/%d/%02d',
+                    cast(strftime('%m', period_end) as integer),
+                    cast(strftime('%d', period_end) as integer),
+                    cast(strftime('%Y', period_end) as integer) % 100
+                ) AS period_label,
+                period_end,
+                value
+            FROM standalone
+            WHERE value IS NOT NULL
             ORDER BY metric_name, {sort_col}
         """
     cursor = conn.execute(sql, {

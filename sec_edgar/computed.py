@@ -11,12 +11,36 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 
 # Type aliases
 Data = Dict[str, Dict[str, Optional[float]]]
 PeriodValues = Dict[str, Optional[float]]
+
+
+def _is_quarterly_periods(periods: List[str]) -> bool:
+    """Return True if period labels represent quarterly (not annual) granularity.
+
+    Handles both M/D/YY date labels (new format) and legacy 'YYYY QN' labels.
+    Detects quarterly by checking whether any consecutive date gap is < 120 days.
+    """
+    dates = []
+    for p in periods:
+        if p == "LTM":
+            continue
+        if "Q" in p:
+            return True  # legacy "YYYY QN" format
+        if "/" in p:
+            try:
+                dates.append(datetime.strptime(p, "%m/%d/%y"))
+            except ValueError:
+                pass
+    return len(dates) >= 2 and any(
+        (dates[i] - dates[i - 1]).days < 120
+        for i in range(1, len(dates))
+    )
 
 
 def _safe_div(
@@ -201,7 +225,7 @@ class YoYGrowth(ComputedMetric):
     def compute(self, data: Data, periods: List[str], price=None) -> PeriodValues:
         # Annual: compare period[i] vs period[i-1] (one year back)
         # Quarterly: compare period[i] vs period[i-4] (same quarter last year)
-        is_quarterly = bool(periods) and any("Q" in p for p in periods if p != "LTM")
+        is_quarterly = _is_quarterly_periods(periods)
         lookback = 4 if is_quarterly else 1
 
         result: PeriodValues = {}
