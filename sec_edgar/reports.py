@@ -13,6 +13,7 @@ import math
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from .metrics import (
@@ -99,55 +100,99 @@ def _fetch_facts(
         form_values = "('10-K', '10-K/A')"
         period_values = "('FY')"
         year_limit = num_periods + 3
-        period_key_expr = "printf('FY%d', f.fiscal_year)"
-        sort_col = "fiscal_year"
+        period_key_expr = (
+            "printf('%d/%d/%02d',"
+            "  cast(strftime('%m', f.period_end) as integer),"
+            "  cast(strftime('%d', f.period_end) as integer),"
+            "  cast(strftime('%Y', f.period_end) as integer) % 100)"
+        )
+        sort_col = "period_end"
+        sql = f"""
+            WITH min_date AS (
+                SELECT date(MAX(period_end), '-{year_limit} years') AS cutoff
+                FROM xbrl_facts
+                WHERE cik = :cik
+                  AND form IN {form_values}
+            ),
+            ranked AS (
+                SELECT
+                    mm.metric_name,
+                    mm.priority    AS concept_priority,
+                    {period_key_expr} AS period_label,
+                    f.fiscal_year,
+                    f.fiscal_period,
+                    f.period_end,
+                    f.value,
+                    f.filed_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mm.metric_name, f.period_end
+                        ORDER BY mm.priority ASC, f.filed_date DESC
+                    ) AS rn
+                FROM xbrl_facts f
+                JOIN metric_mappings mm
+                    ON  mm.concept   = f.concept
+                    AND mm.taxonomy  = f.taxonomy
+                    AND mm.statement = :statement
+                    AND f.unit       = mm.unit
+                CROSS JOIN min_date
+                WHERE f.cik = :cik
+                  AND f.form IN {form_values}
+                  AND f.fiscal_period IN {period_values}
+                  AND f.period_end >= min_date.cutoff
+                  AND f.value IS NOT NULL
+            )
+            SELECT metric_name, period_label, fiscal_year, fiscal_period,
+                   period_end, value
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY metric_name, {sort_col}
+        """
     else:
         form_values = "('10-Q', '10-Q/A')"
         period_values = "('Q1', 'Q2', 'Q3', 'Q4')"
         year_limit = (num_periods // 4) + 3
         period_key_expr = "printf('%d %s', f.fiscal_year, f.fiscal_period)"
         sort_col = "period_end"
-
-    sql = f"""
-        WITH min_year AS (
-            SELECT MAX(fiscal_year) - {year_limit} AS cutoff
-            FROM xbrl_facts
-            WHERE cik = :cik
-              AND form IN {form_values}
-        ),
-        ranked AS (
-            SELECT
-                mm.metric_name,
-                mm.priority    AS concept_priority,
-                {period_key_expr} AS period_label,
-                f.fiscal_year,
-                f.fiscal_period,
-                f.period_end,
-                f.value,
-                f.filed_date,
-                ROW_NUMBER() OVER (
-                    PARTITION BY mm.metric_name, f.fiscal_year, f.fiscal_period
-                    ORDER BY mm.priority ASC, f.filed_date DESC
-                ) AS rn
-            FROM xbrl_facts f
-            JOIN metric_mappings mm
-                ON  mm.concept   = f.concept
-                AND mm.taxonomy  = f.taxonomy
-                AND mm.statement = :statement
-                AND f.unit       = mm.unit
-            CROSS JOIN min_year
-            WHERE f.cik = :cik
-              AND f.form IN {form_values}
-              AND f.fiscal_period IN {period_values}
-              AND f.fiscal_year >= min_year.cutoff
-              AND f.value IS NOT NULL
-        )
-        SELECT metric_name, period_label, fiscal_year, fiscal_period,
-               period_end, value
-        FROM ranked
-        WHERE rn = 1
-        ORDER BY metric_name, {sort_col}
-    """
+        sql = f"""
+            WITH min_year AS (
+                SELECT MAX(fiscal_year) - {year_limit} AS cutoff
+                FROM xbrl_facts
+                WHERE cik = :cik
+                  AND form IN {form_values}
+            ),
+            ranked AS (
+                SELECT
+                    mm.metric_name,
+                    mm.priority    AS concept_priority,
+                    {period_key_expr} AS period_label,
+                    f.fiscal_year,
+                    f.fiscal_period,
+                    f.period_end,
+                    f.value,
+                    f.filed_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY mm.metric_name, f.fiscal_year, f.fiscal_period
+                        ORDER BY mm.priority ASC, f.filed_date DESC
+                    ) AS rn
+                FROM xbrl_facts f
+                JOIN metric_mappings mm
+                    ON  mm.concept   = f.concept
+                    AND mm.taxonomy  = f.taxonomy
+                    AND mm.statement = :statement
+                    AND f.unit       = mm.unit
+                CROSS JOIN min_year
+                WHERE f.cik = :cik
+                  AND f.form IN {form_values}
+                  AND f.fiscal_period IN {period_values}
+                  AND f.fiscal_year >= min_year.cutoff
+                  AND f.value IS NOT NULL
+            )
+            SELECT metric_name, period_label, fiscal_year, fiscal_period,
+                   period_end, value
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY metric_name, {sort_col}
+        """
     cursor = conn.execute(sql, {
         "cik": cik,
         "statement": statement,
@@ -172,15 +217,18 @@ def _ordered_periods(
 
 
 def _period_sort_key(label: str) -> Tuple:
-    """Sort key for period labels: 'FY2023' or '2023 Q1'."""
+    """Sort key for period labels: 'M/D/YY', 'FY2023', '2023 Q1', or 'LTM'."""
+    if label == "LTM":
+        return (9999, 0, 0)
+    if "/" in label:
+        dt = datetime.strptime(label, "%m/%d/%y")
+        return (dt.year, dt.month, dt.day)
     if label.startswith("FY"):
-        return (int(label[2:]), 0)
+        return (int(label[2:]), 0, 0)
     parts = label.split()
     if len(parts) == 2:
-        year = int(parts[0])
-        q = int(parts[1][1])
-        return (year, q)
-    return (0, 0)
+        return (int(parts[0]), int(parts[1][1]), 0)
+    return (0, 0, 0)
 
 
 def _compute_derived(
@@ -203,6 +251,195 @@ def _compute_derived(
         except Exception:
             result[p] = None
     return result
+
+
+def _compute_derived_single(
+    metric: MetricDef,
+    period: str,
+    values: Dict[Tuple[str, str], Optional[float]],
+) -> Optional[float]:
+    """Evaluate derived_expr for a single period using flat (name, period) facts dict."""
+    try:
+        ns: Dict[str, float] = {}
+        for m in ALL_METRICS:
+            v = values.get((m.name, period))
+            ns[m.name] = v if v is not None else float("nan")
+        val = eval(metric.derived_expr, {"__builtins__": {}}, ns)  # noqa: S307
+        return None if (math.isnan(val) or math.isinf(val)) else val
+    except Exception:
+        return None
+
+
+def _eval_derived_for_period(
+    metric: MetricDef,
+    period: str,
+    pool: Dict[str, Dict[str, Optional[float]]],
+) -> Optional[float]:
+    """Evaluate derived_expr for a single period using pool {name: {period: value}}."""
+    try:
+        ns = {
+            m.name: (
+                pool.get(m.name, {}).get(period)
+                if pool.get(m.name, {}).get(period) is not None
+                else float("nan")
+            )
+            for m in ALL_METRICS
+        }
+        val = eval(metric.derived_expr, {"__builtins__": {}}, ns)  # noqa: S307
+        return None if (math.isnan(val) or math.isinf(val)) else val
+    except Exception:
+        return None
+
+
+def _fetch_ltm(
+    conn: sqlite3.Connection,
+    cik: str,
+    statement: str,
+) -> Dict[str, Optional[float]]:
+    """
+    Compute LTM (Last Twelve Months) values for each metric in a statement.
+
+    For duration metrics: annual + recent_ytd - prior_ytd
+    For instant metrics: most recent quarterly snapshot (fallback to annual)
+    """
+    # Q1: most recent annual value per metric
+    q1_sql = """
+        WITH ranked AS (
+            SELECT mm.metric_name, mm.period_type, f.period_end, f.value,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY mm.metric_name
+                       ORDER BY f.period_end DESC, f.filed_date DESC
+                   ) AS rn
+            FROM xbrl_facts f
+            JOIN metric_mappings mm
+                ON mm.concept = f.concept AND mm.taxonomy = f.taxonomy
+                   AND mm.statement = :stmt AND f.unit = mm.unit
+            WHERE f.cik = :cik AND f.form IN ('10-K', '10-K/A')
+              AND f.fiscal_period = 'FY'
+              AND f.value IS NOT NULL
+        )
+        SELECT metric_name, period_type, period_end, value FROM ranked WHERE rn = 1
+    """
+    rows = conn.execute(q1_sql, {"cik": cik, "stmt": statement}).fetchall()
+    if not rows:
+        return {}
+
+    annual: Dict[str, float] = {}
+    annual_period_type: Dict[str, str] = {}
+    annual_end: Optional[str] = None
+    for row in rows:
+        annual[row["metric_name"]] = row["value"]
+        annual_period_type[row["metric_name"]] = row["period_type"]
+        if annual_end is None or row["period_end"] > annual_end:
+            annual_end = row["period_end"]
+
+    # Q2: most recent quarterly YTD for duration metrics (period_end > annual_end)
+    q2_sql = """
+        WITH ranked AS (
+            SELECT mm.metric_name, f.period_end, f.value,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY mm.metric_name
+                       ORDER BY f.period_end DESC, f.filed_date DESC
+                   ) AS rn
+            FROM xbrl_facts f
+            JOIN metric_mappings mm
+                ON mm.concept = f.concept AND mm.taxonomy = f.taxonomy
+                   AND mm.statement = :stmt AND f.unit = mm.unit
+            WHERE f.cik = :cik AND f.form IN ('10-Q', '10-Q/A')
+              AND f.fiscal_period IN ('Q1', 'Q2', 'Q3', 'Q4')
+              AND mm.period_type = 'duration'
+              AND f.period_end > :annual_end
+              AND f.value IS NOT NULL
+        )
+        SELECT metric_name, period_end, value FROM ranked WHERE rn = 1
+    """
+    q2_rows = conn.execute(q2_sql, {
+        "cik": cik, "stmt": statement, "annual_end": annual_end,
+    }).fetchall()
+
+    recent_ytd: Dict[str, float] = {}
+    recent_q_end: Optional[str] = None
+    prior_ytd: Dict[str, float] = {}
+
+    if q2_rows:
+        for row in q2_rows:
+            recent_ytd[row["metric_name"]] = row["value"]
+            if recent_q_end is None or row["period_end"] > recent_q_end:
+                recent_q_end = row["period_end"]
+
+        # Compute prior_q_end = one year before recent_q_end
+        rq = datetime.strptime(recent_q_end, "%Y-%m-%d")
+        try:
+            prior_q = rq.replace(year=rq.year - 1)
+        except ValueError:
+            prior_q = rq.replace(year=rq.year - 1, day=28)
+        prior_q_end = prior_q.strftime("%Y-%m-%d")
+
+        # Q3: prior-year same quarter YTD for duration metrics
+        q3_sql = """
+            WITH ranked AS (
+                SELECT mm.metric_name, f.value,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY mm.metric_name
+                           ORDER BY f.filed_date DESC
+                       ) AS rn
+                FROM xbrl_facts f
+                JOIN metric_mappings mm
+                    ON mm.concept = f.concept AND mm.taxonomy = f.taxonomy
+                       AND mm.statement = :stmt AND f.unit = mm.unit
+                WHERE f.cik = :cik AND f.form IN ('10-Q', '10-Q/A')
+                  AND f.fiscal_period IN ('Q1', 'Q2', 'Q3', 'Q4')
+                  AND mm.period_type = 'duration'
+                  AND f.period_end = :prior_q_end
+                  AND f.value IS NOT NULL
+            )
+            SELECT metric_name, value FROM ranked WHERE rn = 1
+        """
+        q3_rows = conn.execute(q3_sql, {
+            "cik": cik, "stmt": statement, "prior_q_end": prior_q_end,
+        }).fetchall()
+        prior_ytd = {row["metric_name"]: row["value"] for row in q3_rows}
+
+    # Q4: most recent quarterly snapshot for instant metrics (period_end > annual_end)
+    q4_sql = """
+        WITH ranked AS (
+            SELECT mm.metric_name, f.value,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY mm.metric_name
+                       ORDER BY f.period_end DESC, f.filed_date DESC
+                   ) AS rn
+            FROM xbrl_facts f
+            JOIN metric_mappings mm
+                ON mm.concept = f.concept AND mm.taxonomy = f.taxonomy
+                   AND mm.statement = :stmt AND f.unit = mm.unit
+            WHERE f.cik = :cik AND f.form IN ('10-Q', '10-Q/A')
+              AND f.fiscal_period IN ('Q1', 'Q2', 'Q3', 'Q4')
+              AND mm.period_type = 'instant'
+              AND f.period_end > :annual_end
+              AND f.value IS NOT NULL
+        )
+        SELECT metric_name, value FROM ranked WHERE rn = 1
+    """
+    q4_rows = conn.execute(q4_sql, {
+        "cik": cik, "stmt": statement, "annual_end": annual_end,
+    }).fetchall()
+    snapshot: Dict[str, float] = {row["metric_name"]: row["value"] for row in q4_rows}
+
+    # Assemble LTM values
+    ltm: Dict[str, Optional[float]] = {}
+    for name, ann_val in annual.items():
+        ptype = annual_period_type.get(name, "duration")
+        if ptype == "instant":
+            ltm[name] = snapshot.get(name, ann_val)
+        else:
+            recent = recent_ytd.get(name)
+            prior = prior_ytd.get(name)
+            if recent is not None and prior is not None:
+                ltm[name] = ann_val + recent - prior
+            else:
+                ltm[name] = ann_val
+
+    return ltm
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +474,16 @@ def build_report(
             derived_vals = _compute_derived(m, periods, facts)
             for p, v in derived_vals.items():
                 facts[(m.name, p)] = v
+
+    # Add LTM column for annual reports
+    if period == "annual":
+        ltm_vals = _fetch_ltm(conn, cik, statement)
+        for name, val in ltm_vals.items():
+            facts[(name, "LTM")] = val
+        for m in metrics:
+            if m.is_derived and m.derived_expr:
+                facts[(m.name, "LTM")] = _compute_derived_single(m, "LTM", facts)
+        periods = periods + ["LTM"]
 
     # Build annotation metadata lookup: name → (display, fmt)
     ann_meta: Dict[str, tuple] = {m.name: (m.display, m.fmt) for m in ALL_COMPUTED}
@@ -662,6 +909,19 @@ def fetch_all_metrics(
                 except Exception:
                     result[p] = None
             pool[m.name] = result
+
+    # Add LTM column for annual reports
+    if period == "annual":
+        for stmt in ("income_statement", "balance_sheet", "cash_flow"):
+            for name, val in _fetch_ltm(conn, cik, stmt).items():
+                all_flat[(name, "LTM")] = val
+        all_periods = all_periods + ["LTM"]
+        pool = _pool_from_flat(all_flat, all_periods)
+        for m in ALL_METRICS:
+            if m.is_derived and m.derived_expr:
+                pool.setdefault(m.name, {})["LTM"] = _eval_derived_for_period(
+                    m, "LTM", pool
+                )
 
     return pool, all_periods
 
