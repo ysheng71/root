@@ -25,6 +25,10 @@ class MetricDef:
     is_derived: bool = False       # computed from other metrics
     derived_expr: Optional[str] = None  # Python expr; other metrics are variables
     sort_order: int = field(default=0, compare=False)
+    # When True, skip the YTD LAG subtraction in quarterly mode.
+    # Used for weighted-average share counts: the 6-month average minus the
+    # 3-month average is not a valid standalone Q2 weighted average.
+    skip_ytd_subtraction: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +109,13 @@ INCOME_STATEMENT: List[MetricDef] = [
         ["WeightedAverageNumberOfSharesOutstandingBasic",
          "WeightedAverageNumberOfSharesOutstandingBasicAndDiluted",
          "CommonStockSharesOutstanding"],
-        section="per_share", indent=1),
+        section="per_share", indent=1, skip_ytd_subtraction=True),
     MetricDef("shares_diluted", "Shares Outstanding (Diluted)", _IS, _DUR, "shares",
         ["WeightedAverageNumberOfDilutedSharesOutstanding",
          "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
          "WeightedAverageNumberOfSharesOutstandingBasicAndDiluted",
          "CommonStockSharesOutstanding"],
-        section="per_share", indent=1),
+        section="per_share", indent=1, skip_ytd_subtraction=True),
 ]
 
 
@@ -351,5 +355,6 @@ def metric_mappings_rows() -> List[dict]:
                 "concept": concept,
                 "taxonomy": "us-gaap",
                 "priority": priority,
+                "skip_ytd_subtraction": 1 if m.skip_ytd_subtraction else 0,
             })
     return rows

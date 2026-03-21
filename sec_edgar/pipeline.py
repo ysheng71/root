@@ -126,3 +126,13 @@ def _process_ticker(
     conn.commit()
 
     click.echo(f"[{ticker}] Done. {inserted} new facts inserted.")
+
+    # Detect stock splits from newly ingested data
+    splits = db.detect_and_upsert_splits(conn, cik, ticker=ticker)
+    if splits:
+        for s in splits:
+            click.echo(
+                f"[{ticker}] Stock split detected: {s['numerator']}:{s['denominator']} "
+                f"~{s['ex_date']} (confidence {s['confidence']:.3f}, "
+                f"factor from {s['ref_concept']})"
+            )

@@ -117,7 +117,7 @@ class TestFiscalYearBugRegression:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
 
         # Find the label for 9/30/24
         label_9_30_24 = "9/30/24"
@@ -148,7 +148,7 @@ class TestFiscalYearBugRegression:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
 
         # 18813 should only appear under 9/30/22, never under 9/30/24
         val_9_30_24 = result.get(("operating_income", "9/30/24"))
@@ -172,7 +172,7 @@ class TestColumnLabelFormat:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
         period_labels = {p for (_, p) in result.keys()}
 
         assert "9/30/24" in period_labels, f"Expected '9/30/24' in {period_labels}"
@@ -192,7 +192,7 @@ class TestColumnLabelFormat:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
         period_labels = {p for (_, p) in result.keys()}
         assert "12/31/23" in period_labels, f"Expected '12/31/23' in {period_labels}"
 
@@ -389,7 +389,7 @@ class TestQuarterlyPeriodEndTiebreaker:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
 
         # Current Q1 period_end=2024-12-31 → label "12/31/24"
         key = ("operating_income", "12/31/24")
@@ -428,7 +428,7 @@ class TestQuarterlyPeriodEndTiebreaker:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
 
         assert result.get(("operating_income", "12/31/24")) == pytest.approx(9_000_000_000.0)
         assert result.get(("operating_income", "12/31/23")) == pytest.approx(8_000_000_000.0)
@@ -634,7 +634,7 @@ class TestCapexConceptMapping:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "cash_flow", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "cash_flow", "annual", num_periods=5)
 
         key = ("capex", "9/30/25")
         assert key in result, f"Expected capex in cash_flow results, keys: {list(result.keys())[:10]}"
@@ -665,7 +665,7 @@ class TestTotalEquityConceptMapping:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "balance_sheet", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "balance_sheet", "annual", num_periods=5)
 
         key = ("total_equity", "9/30/25")
         assert key in result, f"Expected total_equity in balance_sheet results"
@@ -774,7 +774,7 @@ class TestInterestExpenseConceptMapping:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "annual", num_periods=5)
 
         key = ("interest_expense", "9/30/25")
         assert key in result, f"Expected interest_expense in income_statement results"
@@ -863,13 +863,13 @@ class TestQuarterlyYtdToStandalone:
     def test_q1_standalone_unchanged(self, conn):
         """Q1 value is already standalone — LAG subtracts 0."""
         self._seed_ytd(conn)
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
         assert result.get(("operating_income", "12/31/24")) == pytest.approx(9_000_000_000.0)
 
     def test_q2_ytd_converted_to_standalone(self, conn):
         """Q2 YTD 19000M minus Q1 YTD 9000M = standalone 10000M."""
         self._seed_ytd(conn)
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
         assert result.get(("operating_income", "3/31/25")) == pytest.approx(10_000_000_000.0), (
             "Bug #2: Q2 should be standalone 10B, not YTD 19B"
         )
@@ -877,7 +877,7 @@ class TestQuarterlyYtdToStandalone:
     def test_q3_ytd_converted_to_standalone(self, conn):
         """Q3 YTD 29000M minus Q2 YTD 19000M = standalone 10000M."""
         self._seed_ytd(conn)
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
         assert result.get(("operating_income", "6/30/25")) == pytest.approx(10_000_000_000.0), (
             "Bug #2: Q3 should be standalone 10B, not YTD 29B"
         )
@@ -885,14 +885,14 @@ class TestQuarterlyYtdToStandalone:
     def test_instant_metric_not_subtracted(self, conn):
         """Balance sheet snapshots must be used directly, not YTD-subtracted."""
         self._seed_ytd(conn)
-        result = _fetch_facts(conn, CIK, "balance_sheet", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "balance_sheet", "quarterly", num_periods=5)
         assert result.get(("total_assets", "12/31/24")) == pytest.approx(91_888_000_000.0)
         assert result.get(("total_assets", "3/31/25")) == pytest.approx(92_853_000_000.0)
 
     def test_period_labels_use_period_end_date(self, conn):
         """Quarterly column labels must be M/D/YY of period_end, not 'YYYY QN'."""
         self._seed_ytd(conn)
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=5)
         labels = {p for (_, p) in result.keys()}
         assert "12/31/24" in labels
         assert "3/31/25" in labels
@@ -930,7 +930,7 @@ class TestQuarterlyYtdToStandalone:
         db_mod.bulk_insert_facts(conn, prior_facts)
         self._seed_ytd(conn)  # FY2025 data
 
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=8)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=8)
 
         # FY2024 Q2 standalone = 17500 - 8500 = 9000M
         assert result.get(("operating_income", "3/31/24")) == pytest.approx(9_000_000_000.0)
@@ -983,7 +983,7 @@ class TestQuarterlyYtdToStandalone:
         db_mod.bulk_insert_facts(conn, facts)
         conn.commit()
 
-        result = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=8)
+        result, _ = _fetch_facts(conn, CIK, "income_statement", "quarterly", num_periods=8)
 
         # Q4 label = period_end "9/30/25"
         key = ("operating_income", "9/30/25")

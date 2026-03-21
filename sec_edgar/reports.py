@@ -142,7 +142,7 @@ def _fetch_facts(
                   AND f.value IS NOT NULL
             )
             SELECT metric_name, period_label, fiscal_year, fiscal_period,
-                   period_end, value
+                   period_end, value, filed_date
             FROM ranked
             WHERE rn = 1
             ORDER BY metric_name, {sort_col}
@@ -165,6 +165,7 @@ def _fetch_facts(
                     mm.metric_name,
                     mm.period_type,
                     mm.priority,
+                    mm.skip_ytd_subtraction,
                     f.fiscal_year,
                     CASE WHEN f.fiscal_period = 'FY' THEN 'Q4'
                          ELSE f.fiscal_period END AS fiscal_period,
@@ -215,13 +216,14 @@ def _fetch_facts(
             ),
             -- Convert YTD cumulative values to standalone quarter values by
             -- subtracting the prior quarter's YTD (LAG within the same YTD group).
-            -- Instant metrics are snapshots and are used directly.
+            -- Instant metrics and metrics flagged skip_ytd_subtraction are used directly.
             standalone AS (
                 SELECT
                     metric_name,
                     period_end,
+                    filed_date,
                     CASE
-                        WHEN is_ytd = 1 THEN
+                        WHEN is_ytd = 1 AND skip_ytd_subtraction = 0 THEN
                             value - COALESCE(
                                 LAG(value) OVER (
                                     PARTITION BY metric_name, fiscal_year, is_ytd
@@ -241,7 +243,8 @@ def _fetch_facts(
                     cast(strftime('%Y', period_end) as integer) % 100
                 ) AS period_label,
                 period_end,
-                value
+                value,
+                filed_date
             FROM standalone
             WHERE value IS NOT NULL
             ORDER BY metric_name, {sort_col}
@@ -252,11 +255,13 @@ def _fetch_facts(
     })
 
     result: Dict[Tuple[str, str], Optional[float]] = {}
+    filed_dates: Dict[Tuple[str, str], Optional[str]] = {}
     for row in cursor.fetchall():
         key = (row["metric_name"], row["period_label"])
         result[key] = row["value"]
+        filed_dates[key] = row["filed_date"]
 
-    return result
+    return result, filed_dates
 
 
 def _ordered_periods(
@@ -921,6 +926,70 @@ def _pool_from_flat(
     return pool
 
 
+def _label_to_iso(label: str) -> Optional[str]:
+    """Convert a 'M/D/YY' period label back to 'YYYY-MM-DD', or None if not parseable."""
+    if not label or label == "LTM" or label.startswith("FY"):
+        return None
+    try:
+        dt = datetime.strptime(label, "%m/%d/%y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _apply_split_adjustments(
+    conn,
+    cik: str,
+    pool: Dict[str, Dict[str, Optional[float]]],
+    filed_dates: Dict[Tuple[str, str], Optional[str]],
+) -> None:
+    """
+    Apply stock-split adjustment factors in-place to per-share metrics in pool.
+
+    For each detected split, any metric value where:
+      - the period predates the split (period_end < split.ex_date), AND
+      - the fact was filed before the first retroactively-adjusted filing
+        (filed_date_of_chosen_fact < split.adjustment_boundary)
+    is scaled by the split factor:
+      EPS metrics:   value / (numerator / denominator)
+      Share metrics: value * (numerator / denominator)
+
+    Uses `filed_dates` — the filing date of the exact row that `_fetch_facts`
+    selected for each (metric_name, period_label) — rather than querying MAX
+    across all filings. This correctly handles EDGAR's practice of tagging
+    comparative-period facts with the reporting fiscal year rather than the
+    period's own fiscal year, which would otherwise cause a mismatch.
+    """
+    from .db import load_splits, SPLIT_ADJUSTED_METRICS
+
+    splits = load_splits(conn, cik)
+    if not splits:
+        return
+
+    for split in splits:
+        factor = split["numerator"] / split["denominator"]
+        ex_date = split["ex_date"]
+        boundary = split["adjustment_boundary"]
+
+        for metric_name, direction in SPLIT_ADJUSTED_METRICS.items():
+            if metric_name not in pool:
+                continue
+            for period_label, value in list(pool[metric_name].items()):
+                if value is None:
+                    continue
+                period_end = _label_to_iso(period_label)
+                if period_end is None or period_end >= ex_date:
+                    continue  # post-split or unparseable period
+                # Use the filing date of the exact row _fetch_facts selected.
+                fact_filed = filed_dates.get((metric_name, period_label))
+                if fact_filed is None or fact_filed >= boundary:
+                    continue  # already filed after the retroactive adjustment
+                if direction == "divide":
+                    pool[metric_name][period_label] = value / factor
+                else:
+                    pool[metric_name][period_label] = value * factor
+
+
 def fetch_all_metrics(
     conn: sqlite3.Connection,
     cik: str,
@@ -934,9 +1003,11 @@ def fetch_all_metrics(
     """
     # Collect flat facts across all statements
     all_flat: Dict[Tuple[str, str], Optional[float]] = {}
+    all_filed_dates: Dict[Tuple[str, str], Optional[str]] = {}
     for stmt in ("income_statement", "balance_sheet", "cash_flow"):
-        flat = _fetch_facts(conn, cik, stmt, period, num_periods)
+        flat, filed_dates = _fetch_facts(conn, cik, stmt, period, num_periods)
         all_flat.update(flat)
+        all_filed_dates.update(filed_dates)
 
     # Determine the unified period list
     all_periods = _ordered_periods(all_flat, period, num_periods)
@@ -963,6 +1034,10 @@ def fetch_all_metrics(
                 except Exception:
                     result[p] = None
             pool[m.name] = result
+
+    # Apply stock-split adjustments before computing derived/LTM values so that
+    # per-share denominators (shares_basic, shares_diluted) are already corrected.
+    _apply_split_adjustments(conn, cik, pool, all_filed_dates)
 
     # Add LTM column for annual reports — inject incrementally to preserve derived metrics
     if period == "annual":
