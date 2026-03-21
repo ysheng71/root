@@ -252,6 +252,9 @@ class QoQGrowth(ComputedMetric):
         return [self.metric]
 
     def compute(self, data: Data, periods: List[str], price=None) -> PeriodValues:
+        # QoQ is only meaningful for quarterly data; in annual mode it duplicates YoY
+        if not _is_quarterly_periods(periods):
+            return {p: None for p in periods}
         result: PeriodValues = {}
         for i, p in enumerate(periods):
             if i == 0:

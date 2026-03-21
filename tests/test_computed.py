@@ -318,12 +318,19 @@ class TestQoQGrowth:
         expected = (vals[p4] - vals[p3]) / abs(vals[p3]) * 100
         assert result[p4] == pytest.approx(expected)
 
-    def test_annual_labels_still_use_lookback_one(self):
-        # QoQ is always sequential, even with FY labels
+    def test_annual_labels_return_all_none(self):
+        # QoQ is suppressed (returns all None) for annual periods to avoid duplicating YoY
         data = {"revenue": {"FY2021": 100.0, "FY2022": 120.0}}
         result = self._make().compute(data, ["FY2021", "FY2022"])
         assert result["FY2021"] is None
-        assert result["FY2022"] == pytest.approx(20.0)
+        assert result["FY2022"] is None
+
+    def test_mdyy_annual_labels_return_all_none(self):
+        # Annual M/D/YY labels (widely spaced) also suppress QoQ
+        data = {"revenue": {"1/28/24": 100.0, "1/26/25": 120.0}}
+        result = self._make().compute(data, ["1/28/24", "1/26/25"])
+        assert result["1/28/24"] is None
+        assert result["1/26/25"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -361,7 +361,7 @@ def _fetch_ltm(
             SELECT mm.metric_name, mm.period_type, f.period_end, f.value,
                    ROW_NUMBER() OVER (
                        PARTITION BY mm.metric_name
-                       ORDER BY f.period_end DESC, f.filed_date DESC
+                       ORDER BY f.period_end DESC, mm.priority ASC, f.filed_date DESC
                    ) AS rn
             FROM xbrl_facts f
             JOIN metric_mappings mm
