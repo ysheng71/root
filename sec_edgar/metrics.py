@@ -102,11 +102,15 @@ INCOME_STATEMENT: List[MetricDef] = [
         ["EarningsPerShareDiluted"],
         section="per_share", indent=1),
     MetricDef("shares_basic", "Shares Outstanding (Basic)", _IS, _DUR, "shares",
-        ["WeightedAverageNumberOfSharesOutstandingBasic"],
+        ["WeightedAverageNumberOfSharesOutstandingBasic",
+         "WeightedAverageNumberOfSharesOutstandingBasicAndDiluted",
+         "CommonStockSharesOutstanding"],
         section="per_share", indent=1),
     MetricDef("shares_diluted", "Shares Outstanding (Diluted)", _IS, _DUR, "shares",
         ["WeightedAverageNumberOfDilutedSharesOutstanding",
-         "WeightedAverageNumberOfShareOutstandingBasicAndDiluted"],
+         "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+         "WeightedAverageNumberOfSharesOutstandingBasicAndDiluted",
+         "CommonStockSharesOutstanding"],
         section="per_share", indent=1),
 ]
 

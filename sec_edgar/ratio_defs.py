@@ -216,6 +216,10 @@ PER_SHARE: List[ComputedMetric] = [
           numerator="_tangible_book", denominator="shares_diluted"),
     Ratio("revenue_per_share", "Revenue per Share", "per_share", "currency_per_share",
           numerator="revenue", denominator="shares_diluted"),
+    Ratio("eps_basic_calc", "EPS (Basic)", "per_share", "currency_per_share",
+          numerator="net_income", denominator="shares_basic"),
+    Ratio("eps_diluted_calc", "EPS (Diluted)", "per_share", "currency_per_share",
+          numerator="net_income", denominator="shares_diluted"),
 ]
 
 
