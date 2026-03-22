@@ -29,6 +29,11 @@ class MetricDef:
     # Used for weighted-average share counts: the 6-month average minus the
     # 3-month average is not a valid standalone Q2 weighted average.
     skip_ytd_subtraction: bool = False
+    # When set, the quarterly SQL applies split-factor correction when deriving
+    # standalone values from YTD facts that straddle a split boundary.
+    # 'divide' = EPS-type (post-split value = pre-split / factor)
+    # 'multiply' = share-count type (post-split = pre-split * factor)
+    split_direction: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +106,10 @@ INCOME_STATEMENT: List[MetricDef] = [
 
     MetricDef("eps_basic", "EPS (Basic)", _IS, _DUR, "USD/shares",
         ["EarningsPerShareBasic"],
-        section="per_share", indent=1),
+        section="per_share", indent=1, split_direction='divide'),
     MetricDef("eps_diluted", "EPS (Diluted)", _IS, _DUR, "USD/shares",
         ["EarningsPerShareDiluted"],
-        section="per_share", indent=1),
+        section="per_share", indent=1, split_direction='divide'),
     MetricDef("shares_basic", "Shares Outstanding (Basic)", _IS, _DUR, "shares",
         ["WeightedAverageNumberOfSharesOutstandingBasic",
          "WeightedAverageNumberOfSharesOutstandingBasicAndDiluted",
@@ -356,5 +361,6 @@ def metric_mappings_rows() -> List[dict]:
                 "taxonomy": "us-gaap",
                 "priority": priority,
                 "skip_ytd_subtraction": 1 if m.skip_ytd_subtraction else 0,
+                "split_direction": m.split_direction,
             })
     return rows

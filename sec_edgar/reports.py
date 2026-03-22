@@ -89,12 +89,17 @@ def _fetch_facts(
     statement: str,
     period: str,
     num_periods: int,
-) -> Dict[Tuple[str, str], Optional[float]]:
+) -> Tuple[Dict[Tuple[str, str], Optional[float]], Dict[Tuple[str, str], Optional[str]], Dict[Tuple[str, str], bool]]:
     """
-    Returns {(metric_name, period_label): best_value} for non-derived metrics.
+    Returns (result, filed_dates, derived_flags) for non-derived metrics.
+    result:       {(metric_name, period_label): value}
+    filed_dates:  {(metric_name, period_label): filed_date}
+    derived_flags:{(metric_name, period_label): True if computed via YTD subtraction}
 
-    Uses ROW_NUMBER() to select: lowest concept priority first, then most
-    recently filed version (handles restatements).
+    Prefers raw standalone quarterly facts (period_start > fiscal-year start).
+    Falls back to deriving standalone from YTD subtraction when no standalone
+    fact exists, applying split-factor correction when the subtraction straddles
+    a split boundary.
     """
     if period == "annual":
         form_values = "('10-K', '10-K/A')"
@@ -142,7 +147,7 @@ def _fetch_facts(
                   AND f.value IS NOT NULL
             )
             SELECT metric_name, period_label, fiscal_year, fiscal_period,
-                   period_end, value, filed_date
+                   period_end, value, filed_date, 0 AS is_derived
             FROM ranked
             WHERE rn = 1
             ORDER BY metric_name, {sort_col}
@@ -166,6 +171,7 @@ def _fetch_facts(
                     mm.period_type,
                     mm.priority,
                     mm.skip_ytd_subtraction,
+                    mm.split_direction,
                     f.fiscal_year,
                     CASE WHEN f.fiscal_period = 'FY' THEN 'Q4'
                          ELSE f.fiscal_period END AS fiscal_period,
@@ -186,54 +192,128 @@ def _fetch_facts(
                   AND f.fiscal_year >= min_year.cutoff
                   AND f.value IS NOT NULL
             ),
-            -- Pick the best concept row per (metric, fiscal_year, fiscal_period)
-            ranked AS (
-                SELECT
-                    *,
+            -- A fact is a standalone quarter if its duration is ~one quarter (<=100 days).
+            -- Q2/Q3 10-Qs include both a ~3-month standalone fact and a ~6/9-month YTD
+            -- cumulative fact for the same metric.  We prefer standalone when available.
+            --
+            -- Q1 always goes to the YTD path: Q1's standalone and YTD are the same
+            -- fact, and it must anchor the LAG chain for Q2 derivation.
+            -- Instant (balance-sheet) facts also go to the YTD path (no subtraction).
+            -- Annual 10-K facts (~365 days) go to the YTD path so that
+            --   Q4_standalone = annual_ytd - Q3_ytd.
+            --
+            -- Note: EDGAR tags comparative prior-year facts with the current fiscal_year,
+            -- so MIN(period_start) approaches fail.  Duration is unambiguous.
+            --
+            -- Best standalone fact per (metric, fiscal_year, fiscal_period).
+            -- Standalone = duration metric, not Q1, period span <= 100 days.
+            ranked_s AS (
+                SELECT *,
                     ROW_NUMBER() OVER (
                         PARTITION BY metric_name, fiscal_year, fiscal_period
                         ORDER BY priority ASC, period_end DESC, filed_date DESC
                     ) AS rn
                 FROM all_rows
+                WHERE period_type = 'duration'
+                  AND fiscal_period != 'Q1'
+                  AND (julianday(period_end) - julianday(period_start)) <= 100
             ),
-            best AS (
-                SELECT * FROM ranked WHERE rn = 1
+            best_s AS (SELECT * FROM ranked_s WHERE rn = 1),
+            -- Best YTD / instant fact per (metric, fiscal_year, fiscal_period).
+            -- YTD = instant, OR Q1 duration, OR duration > 100 days (6/9/12-month).
+            ranked_y AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY metric_name, fiscal_year, fiscal_period
+                        ORDER BY priority ASC, period_end DESC, filed_date DESC
+                    ) AS rn
+                FROM all_rows
+                WHERE period_type != 'duration'
+                   OR fiscal_period = 'Q1'
+                   OR (julianday(period_end) - julianday(period_start)) > 100
             ),
-            -- Mark duration rows whose period_start equals the fiscal-year start as YTD.
-            -- Q1/Q2/Q3 YTD facts all share the same period_start (start of fiscal year).
-            -- Q4 filed as a standalone 3-month 10-Q has a different period_start.
-            flagged AS (
+            best_y AS (SELECT * FROM ranked_y WHERE rn = 1),
+            -- Add LAG over the YTD chain (same metric, same fiscal year, ordered by
+            -- period_end) so we can subtract cumulative-to-date of the prior quarter.
+            ytd_lagged AS (
+                SELECT *,
+                    LAG(value) OVER (
+                        PARTITION BY metric_name, fiscal_year
+                        ORDER BY period_end
+                    ) AS prev_ytd,
+                    LAG(filed_date) OVER (
+                        PARTITION BY metric_name, fiscal_year
+                        ORDER BY period_end
+                    ) AS prev_filed_date
+                FROM best_y
+            ),
+            -- Derive standalone quarter values from YTD facts.
+            -- When the LAG straddles a split boundary (prev filing pre-split,
+            -- current filing post-split), scale prev_ytd to the post-split unit
+            -- before subtracting, so the derived value is on a consistent scale.
+            -- Q1 (no LAG) and instant metrics are used as-is (is_derived=0).
+            ytd_derived AS (
                 SELECT
-                    b.*,
+                    yl.metric_name,
+                    yl.fiscal_year,
+                    yl.fiscal_period,
+                    yl.period_end,
+                    yl.filed_date,
                     CASE
-                        WHEN b.period_type = 'duration'
-                             AND b.period_start = MIN(b.period_start) OVER (
-                                     PARTITION BY b.metric_name, b.fiscal_year
-                                 )
-                        THEN 1 ELSE 0
-                    END AS is_ytd
-                FROM best b
-            ),
-            -- Convert YTD cumulative values to standalone quarter values by
-            -- subtracting the prior quarter's YTD (LAG within the same YTD group).
-            -- Instant metrics and metrics flagged skip_ytd_subtraction are used directly.
-            standalone AS (
-                SELECT
-                    metric_name,
-                    period_end,
-                    filed_date,
-                    CASE
-                        WHEN is_ytd = 1 AND skip_ytd_subtraction = 0 THEN
-                            value - COALESCE(
-                                LAG(value) OVER (
-                                    PARTITION BY metric_name, fiscal_year, is_ytd
-                                    ORDER BY period_end
-                                ),
+                        WHEN yl.period_type = 'instant'      THEN yl.value
+                        WHEN yl.skip_ytd_subtraction = 1     THEN yl.value
+                        ELSE
+                            yl.value - COALESCE(
+                                CASE
+                                    WHEN yl.split_direction IS NOT NULL
+                                         AND yl.prev_ytd IS NOT NULL
+                                    THEN yl.prev_ytd * COALESCE(
+                                        (SELECT CASE
+                                                    WHEN yl.split_direction = 'divide'
+                                                    THEN CAST(s.denominator AS REAL) / s.numerator
+                                                    ELSE CAST(s.numerator   AS REAL) / s.denominator
+                                                END
+                                         FROM stock_splits s
+                                         WHERE s.cik = :cik
+                                           AND yl.prev_filed_date < s.adjustment_boundary
+                                           AND yl.filed_date      >= s.adjustment_boundary
+                                         ORDER BY s.adjustment_boundary ASC
+                                         LIMIT 1),
+                                        1.0
+                                    )
+                                    ELSE yl.prev_ytd
+                                END,
                                 0.0
                             )
-                        ELSE value
-                    END AS value
-                FROM flagged
+                    END AS value,
+                    CASE
+                        WHEN yl.period_type = 'instant'      THEN 0
+                        WHEN yl.skip_ytd_subtraction = 1     THEN 0
+                        WHEN yl.prev_ytd IS NULL             THEN 0
+                        ELSE 1
+                    END AS is_derived
+                FROM ytd_lagged yl
+            ),
+            -- Merge paths: prefer raw standalone (is_derived=0) over YTD-derived
+            -- (is_derived=1). Q1 and instant metrics come only from ytd_derived
+            -- with is_derived=0 (the value is raw; no subtraction was applied).
+            candidates AS (
+                SELECT metric_name, fiscal_year, fiscal_period,
+                       period_end, filed_date, value, 0 AS is_derived
+                FROM best_s
+                UNION ALL
+                SELECT metric_name, fiscal_year, fiscal_period,
+                       period_end, filed_date, value, is_derived
+                FROM ytd_derived
+            ),
+            final_ranked AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY metric_name, fiscal_year, fiscal_period
+                        ORDER BY is_derived ASC, period_end DESC
+                    ) AS rn
+                FROM candidates
+                WHERE value IS NOT NULL
             )
             SELECT
                 metric_name,
@@ -244,9 +324,10 @@ def _fetch_facts(
                 ) AS period_label,
                 period_end,
                 value,
-                filed_date
-            FROM standalone
-            WHERE value IS NOT NULL
+                filed_date,
+                is_derived
+            FROM final_ranked
+            WHERE rn = 1
             ORDER BY metric_name, {sort_col}
         """
     cursor = conn.execute(sql, {
@@ -256,12 +337,14 @@ def _fetch_facts(
 
     result: Dict[Tuple[str, str], Optional[float]] = {}
     filed_dates: Dict[Tuple[str, str], Optional[str]] = {}
+    derived_flags: Dict[Tuple[str, str], bool] = {}
     for row in cursor.fetchall():
         key = (row["metric_name"], row["period_label"])
         result[key] = row["value"]
         filed_dates[key] = row["filed_date"]
+        derived_flags[key] = bool(row["is_derived"])
 
-    return result, filed_dates
+    return result, filed_dates, derived_flags
 
 
 def _ordered_periods(
@@ -522,7 +605,7 @@ def build_report(
     metrics = STATEMENT_METRICS[statement]
 
     # Fetch raw facts
-    facts = _fetch_facts(conn, cik, statement, period, num_periods)
+    facts, _, _ = _fetch_facts(conn, cik, statement, period, num_periods)
 
     # Determine periods present in data
     periods = _ordered_periods(facts, period, num_periods)
@@ -1004,10 +1087,12 @@ def fetch_all_metrics(
     # Collect flat facts across all statements
     all_flat: Dict[Tuple[str, str], Optional[float]] = {}
     all_filed_dates: Dict[Tuple[str, str], Optional[str]] = {}
+    all_derived_flags: Dict[Tuple[str, str], bool] = {}
     for stmt in ("income_statement", "balance_sheet", "cash_flow"):
-        flat, filed_dates = _fetch_facts(conn, cik, stmt, period, num_periods)
+        flat, filed_dates, derived_flags = _fetch_facts(conn, cik, stmt, period, num_periods)
         all_flat.update(flat)
         all_filed_dates.update(filed_dates)
+        all_derived_flags.update(derived_flags)
 
     # Determine the unified period list
     all_periods = _ordered_periods(all_flat, period, num_periods)
