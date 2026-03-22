@@ -34,6 +34,12 @@ class MetricDef:
     # 'divide' = EPS-type (post-split value = pre-split / factor)
     # 'multiply' = share-count type (post-split = pre-split * factor)
     split_direction: Optional[str] = None
+    # When True, concepts at priority > 0 are additive components of the
+    # priority-0 combined concept.  If no priority-0 concept is available,
+    # the SQL sums all component values instead of picking one.
+    # Example: SellingAndMarketingExpense + GeneralAndAdministrativeExpense
+    #          when SellingGeneralAndAdministrativeExpense is absent.
+    sum_components: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +72,7 @@ INCOME_STATEMENT: List[MetricDef] = [
     MetricDef("selling_general_admin", "Selling, General & Admin", _IS, _DUR, "USD",
         ["SellingGeneralAndAdministrativeExpense",
          "SellingAndMarketingExpense", "GeneralAndAdministrativeExpense"],
-        section="opex", indent=1),
+        section="opex", indent=1, sum_components=True),
     MetricDef("operating_expenses", "Total Operating Expenses", _IS, _DUR, "USD",
         ["OperatingExpenses", "CostsAndExpenses"],
         section="opex"),
@@ -362,5 +368,6 @@ def metric_mappings_rows() -> List[dict]:
                 "priority": priority,
                 "skip_ytd_subtraction": 1 if m.skip_ytd_subtraction else 0,
                 "split_direction": m.split_direction,
+                "sum_components": 1 if m.sum_components else 0,
             })
     return rows

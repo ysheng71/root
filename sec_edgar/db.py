@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS metric_mappings (
     priority              INTEGER NOT NULL DEFAULT 0,
     skip_ytd_subtraction  INTEGER NOT NULL DEFAULT 0,
     split_direction       TEXT    DEFAULT NULL,
+    sum_components        INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (metric_name, concept, taxonomy)
 );
 """
@@ -157,6 +158,15 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Add sum_components column if it was created before this field existed.
+    try:
+        conn.execute(
+            "ALTER TABLE metric_mappings ADD COLUMN "
+            "sum_components INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 
 def _seed_metric_mappings(conn: sqlite3.Connection) -> None:
@@ -168,11 +178,11 @@ def _seed_metric_mappings(conn: sqlite3.Connection) -> None:
         INSERT OR REPLACE INTO metric_mappings
             (metric_name, display_name, statement, period_type, unit, section,
              indent, sort_order, is_derived, concept, taxonomy, priority,
-             skip_ytd_subtraction, split_direction)
+             skip_ytd_subtraction, split_direction, sum_components)
         VALUES
             (:metric_name, :display_name, :statement, :period_type, :unit, :section,
              :indent, :sort_order, :is_derived, :concept, :taxonomy, :priority,
-             :skip_ytd_subtraction, :split_direction)
+             :skip_ytd_subtraction, :split_direction, :sum_components)
         """,
         rows,
     )

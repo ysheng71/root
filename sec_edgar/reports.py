@@ -119,10 +119,12 @@ def _fetch_facts(
                 WHERE cik = :cik
                   AND form IN {form_values}
             ),
-            ranked AS (
+            -- Best filing per (metric, concept, period_end): handles amendments.
+            all_candidates AS (
                 SELECT
                     mm.metric_name,
-                    mm.priority    AS concept_priority,
+                    mm.priority       AS concept_priority,
+                    mm.sum_components,
                     {period_key_expr} AS period_label,
                     f.fiscal_year,
                     f.fiscal_period,
@@ -130,9 +132,9 @@ def _fetch_facts(
                     f.value,
                     f.filed_date,
                     ROW_NUMBER() OVER (
-                        PARTITION BY mm.metric_name, f.period_end
-                        ORDER BY mm.priority ASC, f.filed_date DESC
-                    ) AS rn
+                        PARTITION BY mm.metric_name, f.concept, f.period_end
+                        ORDER BY f.filed_date DESC
+                    ) AS concept_rn
                 FROM xbrl_facts f
                 JOIN metric_mappings mm
                     ON  mm.concept   = f.concept
@@ -145,11 +147,44 @@ def _fetch_facts(
                   AND f.fiscal_period IN {period_values}
                   AND f.period_end >= min_date.cutoff
                   AND f.value IS NOT NULL
+            ),
+            best_per_concept AS (SELECT * FROM all_candidates WHERE concept_rn = 1),
+            -- Lowest priority available per (metric, period_end).
+            min_prio AS (
+                SELECT metric_name, period_end, MIN(concept_priority) AS min_prio
+                FROM best_per_concept
+                GROUP BY metric_name, period_end
+            ),
+            -- Aggregate: when sum_components=1 and no priority-0 concept is present,
+            -- sum all component values (e.g. S&M + G&A for SG&A).
+            -- Otherwise pick the single best concept (lowest priority).
+            ranked AS (
+                SELECT
+                    b.metric_name,
+                    b.period_label,
+                    b.fiscal_year,
+                    b.fiscal_period,
+                    b.period_end,
+                    CASE
+                        WHEN b.sum_components = 1 AND mp.min_prio > 0
+                        THEN SUM(b.value)
+                        ELSE MAX(CASE WHEN b.concept_priority = mp.min_prio THEN b.value END)
+                    END AS value,
+                    CASE
+                        WHEN b.sum_components = 1 AND mp.min_prio > 0
+                        THEN MAX(b.filed_date)
+                        ELSE MAX(CASE WHEN b.concept_priority = mp.min_prio THEN b.filed_date END)
+                    END AS filed_date
+                FROM best_per_concept b
+                JOIN min_prio mp
+                    ON  mp.metric_name = b.metric_name
+                    AND mp.period_end   = b.period_end
+                GROUP BY b.metric_name, b.period_end
             )
             SELECT metric_name, period_label, fiscal_year, fiscal_period,
                    period_end, value, filed_date, 0 AS is_derived
             FROM ranked
-            WHERE rn = 1
+            WHERE value IS NOT NULL
             ORDER BY metric_name, {sort_col}
         """
     else:
@@ -168,6 +203,8 @@ def _fetch_facts(
             all_rows AS (
                 SELECT
                     mm.metric_name,
+                    f.concept,
+                    mm.sum_components,
                     mm.period_type,
                     mm.priority,
                     mm.skip_ytd_subtraction,
@@ -205,34 +242,95 @@ def _fetch_facts(
             -- Note: EDGAR tags comparative prior-year facts with the current fiscal_year,
             -- so MIN(period_start) approaches fail.  Duration is unambiguous.
             --
-            -- Best standalone fact per (metric, fiscal_year, fiscal_period).
+            -- Standalone path: best filing per (metric, concept, fy, fp).
             -- Standalone = duration metric, not Q1, period span <= 100 days.
-            ranked_s AS (
+            ranked_s_concepts AS (
                 SELECT *,
                     ROW_NUMBER() OVER (
-                        PARTITION BY metric_name, fiscal_year, fiscal_period
-                        ORDER BY priority ASC, period_end DESC, filed_date DESC
+                        PARTITION BY metric_name, concept, fiscal_year, fiscal_period
+                        ORDER BY period_end DESC, filed_date DESC
                     ) AS rn
                 FROM all_rows
                 WHERE period_type = 'duration'
                   AND fiscal_period != 'Q1'
                   AND (julianday(period_end) - julianday(period_start)) <= 100
             ),
-            best_s AS (SELECT * FROM ranked_s WHERE rn = 1),
-            -- Best YTD / instant fact per (metric, fiscal_year, fiscal_period).
+            best_s_concepts AS (SELECT * FROM ranked_s_concepts WHERE rn = 1),
+            min_prio_s AS (
+                SELECT metric_name, fiscal_year, fiscal_period, MIN(priority) AS min_prio
+                FROM best_s_concepts
+                GROUP BY metric_name, fiscal_year, fiscal_period
+            ),
+            -- Aggregate standalone: sum components when sum_components=1 and no priority-0
+            -- concept is available; otherwise pick the single best (lowest-priority) concept.
+            best_s AS (
+                SELECT
+                    b.metric_name,
+                    MAX(b.period_type)          AS period_type,
+                    MAX(b.skip_ytd_subtraction) AS skip_ytd_subtraction,
+                    MAX(b.split_direction)       AS split_direction,
+                    b.fiscal_year,
+                    b.fiscal_period,
+                    MIN(b.period_start)          AS period_start,
+                    MAX(b.period_end)            AS period_end,
+                    CASE
+                        WHEN MAX(b.sum_components) = 1 AND mp.min_prio > 0
+                        THEN MAX(b.filed_date)
+                        ELSE MAX(CASE WHEN b.priority = mp.min_prio THEN b.filed_date END)
+                    END AS filed_date,
+                    CASE
+                        WHEN MAX(b.sum_components) = 1 AND mp.min_prio > 0
+                        THEN SUM(b.value)
+                        ELSE MAX(CASE WHEN b.priority = mp.min_prio THEN b.value END)
+                    END AS value
+                FROM best_s_concepts b
+                JOIN min_prio_s mp USING (metric_name, fiscal_year, fiscal_period)
+                GROUP BY b.metric_name, b.fiscal_year, b.fiscal_period
+            ),
+            -- YTD path: best filing per (metric, concept, fy, fp).
             -- YTD = instant, OR Q1 duration, OR duration > 100 days (6/9/12-month).
-            ranked_y AS (
+            ranked_y_concepts AS (
                 SELECT *,
                     ROW_NUMBER() OVER (
-                        PARTITION BY metric_name, fiscal_year, fiscal_period
-                        ORDER BY priority ASC, period_end DESC, filed_date DESC
+                        PARTITION BY metric_name, concept, fiscal_year, fiscal_period
+                        ORDER BY period_end DESC, filed_date DESC
                     ) AS rn
                 FROM all_rows
                 WHERE period_type != 'duration'
                    OR fiscal_period = 'Q1'
                    OR (julianday(period_end) - julianday(period_start)) > 100
             ),
-            best_y AS (SELECT * FROM ranked_y WHERE rn = 1),
+            best_y_concepts AS (SELECT * FROM ranked_y_concepts WHERE rn = 1),
+            min_prio_y AS (
+                SELECT metric_name, fiscal_year, fiscal_period, MIN(priority) AS min_prio
+                FROM best_y_concepts
+                GROUP BY metric_name, fiscal_year, fiscal_period
+            ),
+            -- Aggregate YTD: same sum_components logic as standalone path.
+            best_y AS (
+                SELECT
+                    b.metric_name,
+                    MAX(b.period_type)          AS period_type,
+                    MAX(b.skip_ytd_subtraction) AS skip_ytd_subtraction,
+                    MAX(b.split_direction)       AS split_direction,
+                    b.fiscal_year,
+                    b.fiscal_period,
+                    MIN(b.period_start)          AS period_start,
+                    MAX(b.period_end)            AS period_end,
+                    CASE
+                        WHEN MAX(b.sum_components) = 1 AND mp.min_prio > 0
+                        THEN MAX(b.filed_date)
+                        ELSE MAX(CASE WHEN b.priority = mp.min_prio THEN b.filed_date END)
+                    END AS filed_date,
+                    CASE
+                        WHEN MAX(b.sum_components) = 1 AND mp.min_prio > 0
+                        THEN SUM(b.value)
+                        ELSE MAX(CASE WHEN b.priority = mp.min_prio THEN b.value END)
+                    END AS value
+                FROM best_y_concepts b
+                JOIN min_prio_y mp USING (metric_name, fiscal_year, fiscal_period)
+                GROUP BY b.metric_name, b.fiscal_year, b.fiscal_period
+            ),
             -- Add LAG over the YTD chain (same metric, same fiscal year, ordered by
             -- period_end) so we can subtract cumulative-to-date of the prior quarter.
             ytd_lagged AS (
@@ -604,11 +702,17 @@ def build_report(
 
     metrics = STATEMENT_METRICS[statement]
 
-    # Fetch raw facts
-    facts, _, _ = _fetch_facts(conn, cik, statement, period, num_periods)
+    # Fetch raw facts and apply split adjustments (same as fetch_all_metrics)
+    facts, filed_dates, _ = _fetch_facts(conn, cik, statement, period, num_periods)
 
     # Determine periods present in data
     periods = _ordered_periods(facts, period, num_periods)
+
+    pool = _pool_from_flat(facts, periods)
+    _apply_split_adjustments(conn, cik, pool, filed_dates)
+    for name, period_vals in pool.items():
+        for p, v in period_vals.items():
+            facts[(name, p)] = v
 
     # Compute derived metrics and merge into facts dict
     for m in metrics:
